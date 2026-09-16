@@ -1,0 +1,87 @@
+# Hydrogel Compression Studio v3 · 4층 실험실 수직 압축 장비
+
+Arduino UNO R4 Minima + A4988 + BCL-2L(2 kg) + CI-1580A 구성의 수직 압축 장비 제어 프로그램이다.
+
+## 폴더 구성
+
+```
+v3/
+├─ HydrogelStudio_4F.exe   배포용 실행 파일 (현장에서는 이것만 실행)
+├─ main.py                 python main.py [--demo] [--theme dark|light]
+├─ hydrogel_app/
+│  ├─ profile.py           이 장비의 설정 (조그 명령 JU/JD, 키보드 ↓/↑, COM10/COM11, 2 kg)
+│  ├─ config.py            설정 저장 (포트, 폴더, 거리·속도, 시편 직경·높이, 테마)
+│  ├─ app.py               Tkinter GUI (VS Code Dark+/Light+ 스타일)
+│  ├─ protocol.py          직렬 명령 생성, 인디케이터 파싱, g→N 환산
+│  ├─ serial_io.py         pyserial 래퍼, 데모용 가상 장비
+│  └─ theme.py             색상 팔레트
+├─ firmware/compression_4F_uno_r4/   Arduino 펌웨어
+├─ tests/test_v3.py        자동 테스트
+├─ build.spec              PyInstaller 빌드 스크립트
+└─ requirements.txt
+```
+
+## 실행 / 빌드
+
+```powershell
+python -m pip install -r requirements.txt
+python main.py --demo                     # 장비 없이 가상 장비로 화면 확인
+python main.py                            # 실제 장비
+python -m unittest discover -s tests -v   # 테스트
+pyinstaller --noconfirm --clean build.spec   # dist\HydrogelStudio_4F.exe → v3\ 로 복사
+```
+
+## 직렬 규약 (115200 bps, `\n` 종료)
+
+| 명령 | 동작 | Arduino 응답 |
+|---|---|---|
+| `start,<mm>,<mm/s>` | 자동 이동 (양수 = 하강 = 누르는 방향) | 완료 시 `DONE` |
+| `JU,<mm/s>` / `JD,<mm/s>` | 조그 하강 / 상승 (누르고 있는 동안) | |
+| `STOP` | 감속 정지. 드라이버 여자 유지(위치 고정) | `STOPPED` |
+| `MOFF` | 즉시 정지 + 드라이버 전원 차단 | `MOTOR_OFF` |
+| `MON` | 드라이버 전원 인가 | `MOTOR_ON` |
+
+핀: DIR 2, STEP 3, ENABLE 4(선택), 800 steps/mm, 최대 4000 steps/s, 가속도 2000 steps/s².
+
+**모터 전원 OFF(`MOFF`)가 실제로 동작하려면 A4988 EN 핀을 D4에 배선해야 한다.** 현재처럼 EN이 비어 있으면 드라이버는 항상 활성이라 `MOFF`는 정지만 한다. 수직축이므로 EN을 끊으면 헤드가 자중으로 내려올 수 있다.
+
+로드셀 인디케이터는 `xxx.x` 형식으로 g 값을 보내며 압축 시 음수다. 프로그램은 부호를 반전해 압축력을 양수 N으로 표시·저장한다.
+
+## 시험 흐름
+
+1. 포트를 입력하고 **장비 연결**.
+2. 조그 버튼(또는 ↓ ↑ 키)으로 압축판을 시편 접촉 직전까지 이동.
+3. **현재 하중을 0점으로**.
+4. **시편 직경**과 **시편 초기 높이**(mm, 원통형 가정)를 입력한다. 단면적 A = π(d/2)²로 응력을, 거리/높이로 변형률을 계산한다.
+5. 모드 선택 후 **시험 시작**.
+   - 압축 강도: 목표 거리 도달(`DONE`) 시 자동 종료.
+   - Poroelasticity: 목표 거리 도달 후에도 변위를 유지한 채 계속 기록. **정지 · 기록 종료**로 끝낸다.
+6. 그래프는 **응력-변형률**(기본)과 **힘-거리** 중 선택할 수 있고 시험 중에도 전환된다. Poroelasticity 모드에서는 X축이 시간이고 Y축만 바뀐다.
+7. 상단에 실시간 응력(kPa)·변형률(%)과 **압축 탄성률 E**(변형률 5~15 % 구간 최소제곱 직선 기울기, kPa)를 표시한다. 구간 데이터가 부족하면 `-`로 표시된다.
+8. CSV: 첫 줄은 `# specimen: cylinder, diameter_mm=…, height0_mm=…, area_mm2=…, mode=…` 메타데이터, 이후 `Time (s), Distance (mm), Force (N), Strain (-), Stress (kPa)`. 파일명 `<이름>_YYYYMMDD_HHMMSS.csv`.
+
+목표 거리가 시편 높이 이상이면 압축판이 바닥에 닿으므로 시작을 거부한다.
+
+## 안전 버튼
+
+- **비상 정지 (Esc)**: 이동만 멈춘다. 드라이버는 여자 상태라 축이 현재 위치를 유지한다.
+- **모터 전원 OFF**: 드라이버 전원을 끊는다(EN 배선 필요). 축이 자유 상태가 된다.
+- **모터 전원 ON**: 드라이버 전원을 다시 인가한다. 조그·시험 시작 시에도 자동으로 인가된다.
+
+## v2 대비 변경점
+
+- 이동 완료 판정을 GUI 타이머에서 Arduino `DONE` 신호로 변경. 신호를 놓치면 시간 기준으로 보조 판정.
+- 비상 정지(`STOP`)와 모터 전원 OFF/ON(`MOFF`/`MON`) 버튼 분리 추가.
+- 파서가 부호와 숫자 사이 공백을 허용하도록 보강. 압축력 부호 반전은 v1/v2와 동일.
+- VS Code 스타일 UI, 최대 하중 표시, 로드셀 용량 90% 초과 경고, 설정 자동 저장.
+- 원통형 시편 직경·높이 입력 → 응력-변형률 곡선 실시간 표시, 압축 탄성률(5~15 % 변형률 직선 피팅) 표시, CSV에 Strain/Stress 열 추가.
+- 예상 압축 시간(거리 ÷ 속도) 표시, 이동 진행률 게이지·퍼센트·남은 시간 표시. 응력·변형률은 기록 중이 아닐 때도 실시간 표시.
+- 기록 속도(samples/s) 선택: 지정 간격으로 로드셀 값을 평균해 기록. GitHub Releases에서 새 exe를 내려받아 교체하는 "업데이트 확인" 버튼.
+
+## 다른 PC에서 실행하기
+
+- `HydrogelStudio_4F.exe` 하나만 복사하면 된다. Python, matplotlib 등이 모두 exe 안에 포함되어 있어 별도 설치가 필요 없다.
+- 요구 사항: 64-bit Windows 10 이상. 첫 실행은 임시 폴더에 압축을 푸느라 5~15초 걸릴 수 있다.
+- Windows SmartScreen이 "알 수 없는 게시자" 경고를 띄우면 "추가 정보 → 실행"을 누른다. 서명되지 않은 exe라서 나오는 경고다.
+- 장비 드라이버는 exe와 별개다. Arduino UNO R4 Minima는 Windows 10 이상에서 드라이버 없이 COM 포트로 잡힌다. 로드셀 인디케이터를 잇는 USB-시리얼 어댑터(FTDI, CH340, Prolific 등)는 해당 드라이버가 그 PC에 설치되어 있어야 한다. 장치 관리자에서 COM 번호를 확인해 프로그램에 입력한다.
+- 설정은 `%APPDATA%\HydrogelStudio\settings_4F.json`에 PC별로 저장된다.

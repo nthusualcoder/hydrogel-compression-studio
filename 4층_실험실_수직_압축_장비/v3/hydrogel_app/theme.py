@@ -1,0 +1,67 @@
+"""VS Code Dark+ / Light+ 색상 팔레트."""
+
+DARK = {
+    "name": "dark",
+    "bg": "#1e1e1e",          # editor background
+    "sidebar": "#252526",     # side bar
+    "activity": "#333333",    # activity bar / title bar
+    "panel": "#252526",
+    "border": "#3c3c3c",
+    "input": "#3c3c3c",
+    "input_border": "#3c3c3c",
+    "text": "#cccccc",
+    "text_strong": "#ffffff",
+    "muted": "#858585",
+    "accent": "#0e639c",
+    "accent_hover": "#1177bb",
+    "focus": "#007fd4",
+    "status": "#007acc",
+    "status_text": "#ffffff",
+    "button": "#3a3d41",
+    "button_hover": "#45494e",
+    "danger": "#c72e2e",
+    "danger_hover": "#e03c3c",
+    "warn": "#b58900",
+    "warn_hover": "#cc9a00",
+    "green": "#89d185",
+    "red": "#f14c4c",
+    "yellow": "#cca700",
+    "blue": "#4fc1ff",
+    "graph_line": "#4fc1ff",
+    "graph_grid": "#3c3c3c",
+    "mono": "Consolas",
+}
+
+LIGHT = {
+    "name": "light",
+    "bg": "#ffffff",
+    "sidebar": "#f3f3f3",
+    "activity": "#2c2c2c",
+    "panel": "#f3f3f3",
+    "border": "#e5e5e5",
+    "input": "#ffffff",
+    "input_border": "#cecece",
+    "text": "#333333",
+    "text_strong": "#000000",
+    "muted": "#717171",
+    "accent": "#007acc",
+    "accent_hover": "#0062a3",
+    "focus": "#0090f1",
+    "status": "#007acc",
+    "status_text": "#ffffff",
+    "button": "#e4e6f1",
+    "button_hover": "#d6d8e3",
+    "danger": "#d13438",
+    "danger_hover": "#b02a2e",
+    "warn": "#bf8803",
+    "warn_hover": "#a67602",
+    "green": "#388a34",
+    "red": "#e51400",
+    "yellow": "#bf8803",
+    "blue": "#0451a5",
+    "graph_line": "#0451a5",
+    "graph_grid": "#e5e5e5",
+    "mono": "Consolas",
+}
+
+THEMES = {"dark": DARK, "light": LIGHT}

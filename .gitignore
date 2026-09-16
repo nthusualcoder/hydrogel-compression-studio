@@ -1,0 +1,22 @@
+# 빌드 산출물: exe는 GitHub Releases에 첨부하고 저장소에는 넣지 않는다
+*.exe
+**/build/
+**/dist/
+*.pkg
+*.pyz
+*.toc
+*.pyc
+__pycache__/
+*.zip
+
+# 도구 산출물
+graphify-out/
+.claude/settings.json
+.claude/settings.local.json
+
+# 로컬 설정 / 임시
+*.log
+*.part
+*.bak
+Thumbs.db
+desktop.ini

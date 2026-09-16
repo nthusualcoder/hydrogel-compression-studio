@@ -1,0 +1,13 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\Dohui\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+  "python.testing.unittestEnabled": true,
+  "python.testing.unittestArgs": [
+    "-v",
+    "-s",
+    "tests",
+    "-p",
+    "test_*.py"
+  ],
+  "files.encoding": "utf8"
+}
+
