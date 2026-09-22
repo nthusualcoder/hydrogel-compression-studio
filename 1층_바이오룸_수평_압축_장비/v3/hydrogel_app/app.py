@@ -27,6 +27,7 @@ from .protocol import (
 from .serial_io import DemoRig, open_serial
 from .theme import THEMES
 from . import updater
+from .motion import move_duration, position_at
 
 MOTOR_BAUDRATE = 115200
 INDICATOR_BAUDRATE = 115200
@@ -89,6 +90,7 @@ class HydrogelStudio:
         self._bucket = []            # 평균용 힘 버퍼
         self._bucket_t0 = 0.0        # 현재 버킷 시작 시각
         self._update_info = None
+        self._live_distance = 0.0     # 마지막으로 계산한 명령 위치(mm), 시험 후 표시용
 
         self._build()
         self._apply_theme()
@@ -590,21 +592,34 @@ class HydrogelStudio:
             rate = 10.0
         return 1.0 / rate if rate > 0 else 0.0
 
+    def _commanded_distance(self, elapsed=None):
+        """시각 elapsed(초)의 명령 위치(mm). 펌웨어의 가속·등속·감속 프로파일을 그대로 따른다."""
+        if not self.motor_moving:
+            return self.target_dist
+        if elapsed is None:
+            elapsed = time.time() - self.start_time
+        return position_at(elapsed, self.target_dist, self.test_speed, self.profile.accel_mm_s2)
+
     def _accumulate(self, force):
+        """로드셀 한 줄을 (시각, 위치, 힘)으로 버킷에 넣고, 기록 간격이 차면 세 값을 함께 평균해 기록한다."""
+        now = time.time()
+        elapsed = now - self.start_time
+        distance = self._commanded_distance(elapsed)
         interval = self._sample_interval()
         if interval <= 0:
-            self._record(force)
+            self._record(elapsed, distance, force)
             return
-        now = time.time()
-        self._bucket.append(force)
+        self._bucket.append((elapsed, distance, force))
         if now - self._bucket_t0 >= interval:
-            self._record(sum(self._bucket) / len(self._bucket))
-            self._bucket = []
+            self._flush_bucket()
             self._bucket_t0 += interval * int((now - self._bucket_t0) / interval)
 
     def _flush_bucket(self):
         if self._bucket:
-            self._record(sum(self._bucket) / len(self._bucket))
+            n = len(self._bucket)
+            self._record(sum(b[0] for b in self._bucket) / n,
+                         sum(b[1] for b in self._bucket) / n,
+                         sum(b[2] for b in self._bucket) / n)
             self._bucket = []
 
     # ------------------------------------------------------------------ GitHub 업데이트
@@ -672,22 +687,19 @@ class HydrogelStudio:
     def _download_done(self, path, exe):
         self.update_button.configure(state=tk.NORMAL, text=f"⬇  업데이트 확인  (v{__version__})")
         self._message(f"다운로드 완료: {path}", "ok")
-        if exe and self.show_dialogs and messagebox.askyesno(
+        if exe and not self.is_running and self.show_dialogs and messagebox.askyesno(
             "업데이트 설치",
             f"다운로드했습니다:\n{path}\n\n지금 프로그램을 닫고 새 버전으로 교체한 뒤 다시 실행할까요?\n(기존 파일은 .bak 으로 남습니다. 시험 중이면 '아니오'를 누르세요.)",
             parent=self.root,
         ):
             updater.replace_and_restart(path, exe)
             self.close()
+        elif self.is_running:
+            self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n시험이 끝난 뒤 프로그램을 닫고 이 파일로 바꿔 실행하세요.")
         elif not exe:
             self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n(개발 환경에서는 자동 교체를 하지 않습니다.)")
 
-    def _record(self, force):
-        elapsed = time.time() - self.start_time
-        if self.motor_moving:
-            distance = min(elapsed * self.test_speed, self.target_dist)
-        else:
-            distance = self.target_dist
+    def _record(self, elapsed, distance, force):
         self.time_data.append(elapsed)
         self.dist_data.append(distance)
         self.force_data.append(force)
@@ -697,6 +709,7 @@ class HydrogelStudio:
         self.sb_samples.configure(text=f"{len(self.time_data)} samples · {self.sample_rate_var.get()}/s")
         if self.csv_writer:
             self.csv_writer.writerow([round(elapsed, 3), round(distance, 4), round(force, 4)])
+            self.csv_file.flush()      # 장시간 시험 중 프로그램이 죽어도 그때까지의 데이터는 남긴다
 
     def _check_move_timeout(self):
         """DONE 신호를 놓쳤을 때를 대비한 보조 판정 (예상 시간의 1.5배 + 2초)."""
@@ -749,6 +762,8 @@ class HydrogelStudio:
             self._message("시험 중에는 조그를 사용할 수 없습니다.", "warn")
             return
         try:
+            if float(self.jog_speed_var.get()) > self.profile.max_speed_mm_s:
+                raise ValueError(f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s 입니다 (펌웨어 상한).")
             self.arduino.write(jog_command(cmd, self.jog_speed_var.get()))
         except ValueError as exc:
             self._message(str(exc), "error")
@@ -767,6 +782,9 @@ class HydrogelStudio:
         self._set_state("READY" if not self.is_running else self._state)
 
     def zero_force(self):
+        if self.is_running:
+            self._message("시험 중에는 0점을 바꿀 수 없습니다. 바꾸면 기록된 힘이 어긋납니다.", "warn")
+            return
         self.force_offset_N = -grams_to_newton(self.current_grams)
         self.force_label.configure(text="0.0000 N")
         self._message(f"0점 설정 (raw {self.current_grams:.1f} g)", "ok")
@@ -783,6 +801,8 @@ class HydrogelStudio:
             command = start_command(self.distance_var.get(), self.speed_var.get())
             self.target_dist = float(self.distance_var.get())
             self.test_speed = float(self.speed_var.get())
+            if self.test_speed > self.profile.max_speed_mm_s:
+                raise ValueError(f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s 입니다 (펌웨어 상한). 더 빠르게 보내면 펌웨어가 속도를 잘라 거리 추정이 어긋납니다.")
             self._open_csv()
         except (OSError, ValueError) as exc:
             self._message(str(exc), "error")
@@ -792,7 +812,8 @@ class HydrogelStudio:
         self.line.set_data([], [])
         self.peak_force_N = 0.0
         self._reset_axes()
-        self.expected_move_s = self.target_dist / self.test_speed
+        self.expected_move_s = move_duration(self.target_dist, self.test_speed, self.profile.accel_mm_s2)
+        self._live_distance = 0.0
         self.start_time = time.time()
         self._bucket = []
         self._bucket_t0 = self.start_time

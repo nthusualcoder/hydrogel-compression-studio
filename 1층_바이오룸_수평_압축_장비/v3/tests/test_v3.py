@@ -117,6 +117,73 @@ class AppTests(unittest.TestCase):
         self.assertFalse(is_newer("v3.0.0", "3.0.0"))
         self.assertTrue(is_newer("v4.0.0", "3.9.9"))
 
+    def test_motion_profile(self):
+        from hydrogel_app.motion import move_duration, position_at
+        a = self.app.profile.accel_mm_s2
+        # 사다리꼴: 2 mm @ 1 mm/s → 가속 0.4 s 동안 0.2 mm, 총 2.4 s
+        self.assertAlmostEqual(move_duration(2.0, 1.0, a), 2.0 / 1.0 + 1.0 / a, places=9)
+        self.assertAlmostEqual(position_at(0.4, 2.0, 1.0, a), 0.5 * a * 0.4 ** 2, places=9)
+        self.assertAlmostEqual(position_at(1.0, 2.0, 1.0, a), 0.2 + 0.6, places=9)
+        self.assertAlmostEqual(position_at(99.0, 2.0, 1.0, a), 2.0, places=9)
+        self.assertLess(position_at(1.0, 2.0, 1.0, a), 1.0)          # 옛 계산(t×v)보다 뒤처진다
+        # 삼각형: 0.1 mm @ 5 mm/s → 최고 속도 미도달, 총 2·sqrt(d/a)
+        self.assertAlmostEqual(move_duration(0.1, 5.0, a), 2 * (0.1 / a) ** 0.5, places=9)
+        # 단조 증가
+        prev = 0.0
+        for i in range(1, 60):
+            cur = position_at(i * 0.05, 2.0, 1.0, a)
+            self.assertGreaterEqual(cur, prev - 1e-12); prev = cur
+
+    def test_speed_above_firmware_limit_rejected(self):
+        vmax = self.app.profile.max_speed_mm_s
+        self.app.speed_var.set(str(vmax * 2))
+        self.app.start_button.invoke()
+        self.assertFalse(self.app.is_running)
+        self.app.jog_speed_var.set(str(vmax * 2))
+        n = len(self.motor.writes)
+        self.app.start_jog(self.app.profile.press_cmd)
+        self.assertEqual(len(self.motor.writes), n)          # 조그 명령이 나가지 않았다
+        self.app.speed_var.set(str(vmax))                    # 상한값은 허용
+        self.app.start_button.invoke()
+        self.assertTrue(self.app.is_running)
+        self.app.stop_button.invoke()
+
+    def test_zero_blocked_while_running(self):
+        self.loadcell.queue_line("-5.0\n"); self.pump()
+        self.app.start_button.invoke()
+        before = self.app.force_offset_N
+        self.app.zero_button.invoke()
+        self.assertEqual(self.app.force_offset_N, before)
+        self.app.stop_button.invoke()
+
+    def test_bucket_averages_time_distance_force(self):
+        self.app.start_button.invoke()
+        self.app._bucket = [(0.1, 0.10, 1.0), (0.3, 0.30, 3.0)]
+        self.app._flush_bucket()
+        self.assertAlmostEqual(self.app.time_data[-1], 0.2)
+        self.assertAlmostEqual(self.app.dist_data[-1], 0.2)
+        self.assertAlmostEqual(self.app.force_data[-1], 2.0)
+        self.app.stop_button.invoke()
+
+    def test_recorded_distance_follows_profile_not_linear(self):
+        """기록된 거리는 t×v 가 아니라 가속 프로파일 위치여야 한다."""
+        from hydrogel_app.motion import position_at
+        self.app.distance_var.set("2"); self.app.speed_var.set("1")
+        self.app.start_button.invoke()
+        self.app.start_time -= 1.0                          # 시험 시작 1 s 뒤인 것처럼
+        self.loadcell.queue_line("-10.0\n"); self.pump(0.05)
+        d = self.app.dist_data[-1]
+        self.assertAlmostEqual(d, position_at(self.app.time_data[-1], 2.0, 1.0, self.app.profile.accel_mm_s2), places=6)
+        self.assertLess(d, self.app.time_data[-1] * 1.0)
+        self.app.stop_button.invoke()
+
+    def test_csv_is_flushed_during_test(self):
+        self.app.start_button.invoke()
+        self.loadcell.queue_line("-10.0\n"); self.pump()
+        lines = self.app.csv_path.read_text(encoding="utf-8-sig").splitlines()
+        self.assertGreaterEqual(len(lines), 2)              # 헤더 + 데이터 한 줄이 이미 디스크에 있다
+        self.app.stop_button.invoke()
+
     def test_jog_uses_forward_backward_commands(self):
         self.app.jog_speed_var.set("0.5")
         self.click_hold(self.app.press_button)

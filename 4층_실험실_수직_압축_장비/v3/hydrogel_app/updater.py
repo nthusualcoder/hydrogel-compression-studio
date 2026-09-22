@@ -84,16 +84,19 @@ def running_exe() -> Path | None:
 
 def replace_and_restart(new_file: Path, current_exe: Path):
     """실행 중인 exe를 종료한 뒤 새 파일로 바꾸고 다시 실행하는 배치 스크립트를 띄운다."""
+    pid = os.getpid()
     bat = Path(tempfile.gettempdir()) / "hydrogel_update.bat"
+    # cmd.exe는 배치 파일을 시스템 ANSI 코드페이지(한국어 Windows: CP949)로 읽으므로
+    # 한글 경로가 깨지지 않도록 mbcs 로 저장한다. PID 검사는 앞뒤 공백을 포함해
+    # 정확히 그 숫자만 맞춘다 (1234 가 12345 에 걸리지 않게).
     bat.write_text(
         "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        f":wait\r\n"
-        f"tasklist /FI \"PID eq {os.getpid()}\" | find \"{os.getpid()}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+        ":wait\r\n"
+        f"tasklist /FI \"PID eq {pid}\" | find \" {pid} \" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
         f"copy /Y \"{current_exe}\" \"{current_exe}.bak\" >nul\r\n"
         f"move /Y \"{new_file}\" \"{current_exe}\" >nul\r\n"
         f"start \"\" \"{current_exe}\"\r\n"
         "del \"%~f0\"\r\n",
-        encoding="utf-8",
+        encoding="mbcs",
     )
     subprocess.Popen(["cmd", "/c", str(bat)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

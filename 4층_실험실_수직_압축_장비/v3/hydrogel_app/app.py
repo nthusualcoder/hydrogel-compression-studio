@@ -28,6 +28,7 @@ from .protocol import (
 from .serial_io import DemoRig, open_serial
 from .theme import THEMES
 from . import updater
+from .motion import move_duration, position_at
 
 MOTOR_BAUDRATE = 115200
 INDICATOR_BAUDRATE = 115200
@@ -95,6 +96,7 @@ class HydrogelStudio:
         self._bucket = []            # 평균용 힘 버퍼
         self._bucket_t0 = 0.0        # 현재 버킷 시작 시각
         self._update_info = None
+        self._live_distance = 0.0     # 마지막으로 계산한 명령 위치(mm), 시험 후 표시용
 
         self._build()
         self._apply_theme()
@@ -646,10 +648,12 @@ class HydrogelStudio:
         if abs(grams) > self.profile.max_load_g * 0.9:
             self._message(f"하중이 로드셀 용량({self.profile.loadcell})의 90%를 넘었습니다!", "error")
         if self.is_running:
+            self._live_distance = self._commanded_distance()
+            self._show_live_stress(force, self._live_distance, self.area_mm2, self.height0_mm)
             self._accumulate(force)
         else:
             # 기록 중이 아닐 때도 현재 입력된 시편 치수로 응력을 계속 표시한다.
-            self._show_live_stress(force, self.dist_data[-1] if self.dist_data else 0.0)
+            self._show_live_stress(force, self._live_distance)
 
     def _live_area_mm2(self):
         """현재 입력된 시편 직경으로 단면적(mm²)을 계산한다. 잘못된 값이면 0."""
@@ -666,9 +670,12 @@ class HydrogelStudio:
             return 0.0
         return h if h > 0 else 0.0
 
-    def _show_live_stress(self, force, distance):
-        area = self._live_area_mm2()
-        h0 = self._live_height_mm()
+    def _show_live_stress(self, force, distance, area=None, h0=None):
+        """응력(kPa)·변형률 표시. 시험 중에는 시작 시 고정한 단면적·높이, 그 외에는 입력칸 값을 쓴다."""
+        if area is None:
+            area = self._live_area_mm2()
+        if h0 is None:
+            h0 = self._live_height_mm()
         stress_kPa = force / (area * 1e-6) / 1000.0 if area > 0 else 0.0
         strain = distance / h0 if h0 > 0 else 0.0
         self.stress_label.configure(text=f"{stress_kPa:.3f} kPa  ·  {strain * 100:.1f} %")
@@ -678,8 +685,11 @@ class HydrogelStudio:
         """목표 거리 ÷ 이동 속도 = 예상 압축 시간."""
         try:
             d = float(self.distance_var.get()); v = float(self.speed_var.get())
+            if v > self.profile.max_speed_mm_s:
+                self.eta_label.configure(text=f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s (펌웨어 상한)")
+                return
             if d > 0 and v > 0:
-                t = d / v
+                t = move_duration(d, v, self.profile.accel_mm_s2)
                 txt = f"예상 압축 시간  {t:.1f} s" if t < 120 else f"예상 압축 시간  {t / 60:.1f} min ({t:.0f} s)"
                 self.eta_label.configure(text=txt)
                 return
@@ -693,7 +703,7 @@ class HydrogelStudio:
             return
         elapsed = time.time() - self.start_time
         if self.motor_moving:
-            pct = min(elapsed * self.test_speed / self.target_dist, 1.0) * 100.0
+            pct = min(self._commanded_distance(elapsed) / self.target_dist, 1.0) * 100.0
             remain = max(self.expected_move_s - elapsed, 0.0)
             self.percent_label.configure(text=f"{pct:3.0f} %  ·  남은 {remain:.0f} s")
         else:
@@ -710,21 +720,34 @@ class HydrogelStudio:
             rate = 10.0
         return 1.0 / rate if rate > 0 else 0.0
 
+    def _commanded_distance(self, elapsed=None):
+        """시각 elapsed(초)의 명령 위치(mm). 펌웨어의 가속·등속·감속 프로파일을 그대로 따른다."""
+        if not self.motor_moving:
+            return self.target_dist
+        if elapsed is None:
+            elapsed = time.time() - self.start_time
+        return position_at(elapsed, self.target_dist, self.test_speed, self.profile.accel_mm_s2)
+
     def _accumulate(self, force):
+        """로드셀 한 줄을 (시각, 위치, 힘)으로 버킷에 넣고, 기록 간격이 차면 세 값을 함께 평균해 기록한다."""
+        now = time.time()
+        elapsed = now - self.start_time
+        distance = self._commanded_distance(elapsed)
         interval = self._sample_interval()
         if interval <= 0:
-            self._record(force)
+            self._record(elapsed, distance, force)
             return
-        now = time.time()
-        self._bucket.append(force)
+        self._bucket.append((elapsed, distance, force))
         if now - self._bucket_t0 >= interval:
-            self._record(sum(self._bucket) / len(self._bucket))
-            self._bucket = []
+            self._flush_bucket()
             self._bucket_t0 += interval * int((now - self._bucket_t0) / interval)
 
     def _flush_bucket(self):
         if self._bucket:
-            self._record(sum(self._bucket) / len(self._bucket))
+            n = len(self._bucket)
+            self._record(sum(b[0] for b in self._bucket) / n,
+                         sum(b[1] for b in self._bucket) / n,
+                         sum(b[2] for b in self._bucket) / n)
             self._bucket = []
 
     # ------------------------------------------------------------------ GitHub 업데이트
@@ -792,22 +815,19 @@ class HydrogelStudio:
     def _download_done(self, path, exe):
         self.update_button.configure(state=tk.NORMAL, text=f"⬇  업데이트 확인  (v{__version__})")
         self._message(f"다운로드 완료: {path}", "ok")
-        if exe and self.show_dialogs and messagebox.askyesno(
+        if exe and not self.is_running and self.show_dialogs and messagebox.askyesno(
             "업데이트 설치",
             f"다운로드했습니다:\n{path}\n\n지금 프로그램을 닫고 새 버전으로 교체한 뒤 다시 실행할까요?\n(기존 파일은 .bak 으로 남습니다. 시험 중이면 '아니오'를 누르세요.)",
             parent=self.root,
         ):
             updater.replace_and_restart(path, exe)
             self.close()
+        elif self.is_running:
+            self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n시험이 끝난 뒤 프로그램을 닫고 이 파일로 바꿔 실행하세요.")
         elif not exe:
             self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n(개발 환경에서는 자동 교체를 하지 않습니다.)")
 
-    def _record(self, force):
-        elapsed = time.time() - self.start_time
-        if self.motor_moving:
-            distance = min(elapsed * self.test_speed, self.target_dist)
-        else:
-            distance = self.target_dist
+    def _record(self, elapsed, distance, force):
         strain = distance / self.height0_mm if self.height0_mm > 0 else 0.0
         stress_kPa = force / (self.area_mm2 * 1e-6) / 1000.0 if self.area_mm2 > 0 else 0.0
         self.time_data.append(elapsed)
@@ -825,6 +845,7 @@ class HydrogelStudio:
             self._update_modulus()
         if self.csv_writer:
             self.csv_writer.writerow([round(elapsed, 3), round(distance, 4), round(force, 4), round(strain, 5), round(stress_kPa, 4)])
+            self.csv_file.flush()      # 장시간 시험 중 프로그램이 죽어도 그때까지의 데이터는 남긴다
 
     def _update_modulus(self, lo=0.05, hi=0.15):
         """변형률 lo~hi 구간의 응력-변형률 최소제곱 직선 기울기(kPa)를 압축 탄성률로 표시한다."""
@@ -899,6 +920,8 @@ class HydrogelStudio:
             self._message("시험 중에는 조그를 사용할 수 없습니다.", "warn")
             return
         try:
+            if float(self.jog_speed_var.get()) > self.profile.max_speed_mm_s:
+                raise ValueError(f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s 입니다 (펌웨어 상한).")
             self.arduino.write(jog_command(cmd, self.jog_speed_var.get()))
         except ValueError as exc:
             self._message(str(exc), "error")
@@ -917,8 +940,13 @@ class HydrogelStudio:
         self._set_state("READY" if not self.is_running else self._state)
 
     def zero_force(self):
+        if self.is_running:
+            self._message("시험 중에는 0점을 바꿀 수 없습니다. 바꾸면 기록된 힘이 어긋납니다.", "warn")
+            return
         self.force_offset_N = -grams_to_newton(self.current_grams)
         self.force_label.configure(text="0.0000 N")
+        self._live_distance = 0.0
+        self.stress_label.configure(text="0.000 kPa  ·  0.0 %")
         self._message(f"0점 설정 (raw {self.current_grams:.1f} g)", "ok")
 
     # ------------------------------------------------------------------ 시험
@@ -933,6 +961,8 @@ class HydrogelStudio:
             command = start_command(self.distance_var.get(), self.speed_var.get())
             self.target_dist = float(self.distance_var.get())
             self.test_speed = float(self.speed_var.get())
+            if self.test_speed > self.profile.max_speed_mm_s:
+                raise ValueError(f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s 입니다 (펌웨어 상한). 더 빠르게 보내면 펌웨어가 속도를 잘라 거리 추정이 어긋납니다.")
             diameter = float(self.diameter_var.get())
             self.height0_mm = float(self.height_var.get())
             if diameter <= 0 or self.height0_mm <= 0:
@@ -955,7 +985,8 @@ class HydrogelStudio:
         self.progress_var.set(0.0)
         self.percent_label.configure(text="0 %")
         self._reset_axes()
-        self.expected_move_s = self.target_dist / self.test_speed
+        self.expected_move_s = move_duration(self.target_dist, self.test_speed, self.profile.accel_mm_s2)
+        self._live_distance = 0.0
         self.start_time = time.time()
         self._bucket = []
         self._bucket_t0 = self.start_time
@@ -979,7 +1010,7 @@ class HydrogelStudio:
         self.csv_path = path
         self.csv_file = path.open("w", newline="", encoding="utf-8-sig")
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_file.write(f"# specimen: cylinder, diameter_mm={float(self.diameter_var.get()):g}, height0_mm={self.height0_mm:g}, area_mm2={self.area_mm2:.4f}, mode={self.mode_var.get()}\r\n")
+        self.csv_file.write(f"# specimen: cylinder, diameter_mm={float(self.diameter_var.get()):g}, height0_mm={self.height0_mm:g}, area_mm2={self.area_mm2:.4f}, mode={self.mode_var.get()}, stress=engineering F/A0, strain=distance/height0, distance=commanded trapezoid accel_mm_s2={self.profile.accel_mm_s2:g}\r\n")
         self.csv_writer.writerow(["Time (s)", "Distance (mm)", "Force (N)", "Strain (-)", "Stress (kPa)"])
         self.csv_label.configure(text=f"기록 중: {path.name}")
 

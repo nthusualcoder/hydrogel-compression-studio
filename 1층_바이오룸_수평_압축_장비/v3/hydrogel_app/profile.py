@@ -18,6 +18,8 @@ class DeviceProfile:
     default_motor_port: str
     default_indicator_port: str
     max_load_g: float        # 로드셀 정격 용량 (경고용)
+    max_speed_mm_s: float    # 펌웨어 MAX_SPEED_SPS ÷ STEPS_PER_MM. 이보다 빠른 명령은 펌웨어가 잘라 버려 거리 추정이 어긋난다
+    accel_mm_s2: float       # 펌웨어 ACCEL_SPS2 ÷ STEPS_PER_MM. 거리 추정(사다리꼴 프로파일)에 사용
 
 
 PROFILE = DeviceProfile(
@@ -35,4 +37,6 @@ PROFILE = DeviceProfile(
     default_motor_port="COM3",
     default_indicator_port="COM4",
     max_load_g=3000.0,
+    max_speed_mm_s=5000.0 / 800.0,   # 6.25 mm/s
+    accel_mm_s2=2000.0 / 800.0,      # 2.5 mm/s²
 )
