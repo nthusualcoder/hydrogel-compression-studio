@@ -14,6 +14,7 @@ from matplotlib.figure import Figure
 
 from . import __version__
 from .config import AppSettings, default_config_path, load_settings, save_settings
+from .layout import fit_window, work_area
 from .profile import PROFILE, DeviceProfile
 from .protocol import (
     grams_to_newton,
@@ -91,6 +92,7 @@ class HydrogelStudio:
         self._bucket_t0 = 0.0        # 현재 버킷 시작 시각
         self._update_info = None
         self._live_distance = 0.0     # 마지막으로 계산한 명령 위치(mm), 시험 후 표시용
+        self._wheel_acc = 0.0         # 한 칸보다 작은 휠 값을 모으는 누적기(px)
 
         self._build()
         self._apply_theme()
@@ -110,24 +112,27 @@ class HydrogelStudio:
     def _build(self):
         p = self.profile
         self.root.title(f"{p.title}  ·  v{__version__}")
-        self.root.geometry("1360x860")
-        self.root.minsize(1180, 760)
+        w, h, x, y, min_w, min_h = fit_window(work_area(self.root))
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.minsize(min_w, min_h)
 
         self.style = ttk.Style(self.root)
         self.style.theme_use("clam")
+        self.style.layout("Hydro.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
 
         # ── 상단 타이틀 바
         self.titlebar = tk.Frame(self.root, height=44)
         self.titlebar.pack(fill=tk.X, side=tk.TOP)
         self.titlebar.pack_propagate(False)
         self.title_label = tk.Label(self.titlebar, text="Hydrogel Compression Studio", font=(UI_FONT, 12, "bold"))
-        self.title_label.pack(side=tk.LEFT, padx=(16, 8))
-        self.subtitle_label = tk.Label(self.titlebar, text=f"{p.location}   ·   {p.board}   ·   {p.loadcell}", font=(UI_FONT, 9))
-        self.subtitle_label.pack(side=tk.LEFT)
+        self.subtitle_label = tk.Label(self.titlebar, text=f"{p.location}   ·   {p.board}   ·   {p.loadcell}", font=(UI_FONT, 9), anchor="w")
         self.theme_button = tk.Button(self.titlebar, text="", command=self.toggle_theme, relief=tk.FLAT, bd=0, padx=12, cursor="hand2", font=(UI_FONT, 9))
-        self.theme_button.pack(side=tk.RIGHT, padx=8, pady=8)
         self.update_button = tk.Button(self.titlebar, text=f"⬇  업데이트 확인  (v{__version__})", command=self.check_for_update, relief=tk.FLAT, bd=0, padx=12, cursor="hand2", font=(UI_FONT, 9))
+        # 버튼을 먼저 배치한다. 창이 좁아지면 잘리는 쪽은 부제목의 끝이다
+        self.theme_button.pack(side=tk.RIGHT, padx=8, pady=8)
         self.update_button.pack(side=tk.RIGHT, padx=(8, 0), pady=8)
+        self.title_label.pack(side=tk.LEFT, padx=(16, 8))
+        self.subtitle_label.pack(side=tk.LEFT)
 
         # ── 하단 상태 바
         self.statusbar = tk.Frame(self.root, height=24)
@@ -166,10 +171,11 @@ class HydrogelStudio:
         self._bind_keys()
 
     # 사이드바 ---------------------------------------------------------------
-    def _section(self, title):
-        header = tk.Label(self.sidebar, text=title.upper(), font=(UI_FONT, 8, "bold"), anchor="w", padx=16, pady=4)
+    def _section(self, title, parent=None):
+        parent = parent or self.sidebar_inner
+        header = tk.Label(parent, text=title.upper(), font=(UI_FONT, 8, "bold"), anchor="w", padx=16, pady=4)
         header.pack(fill=tk.X, pady=(3, 0))
-        frame = tk.Frame(self.sidebar, padx=16, pady=2)
+        frame = tk.Frame(parent, padx=16, pady=2)
         frame.pack(fill=tk.X)
         self._section_headers.append(header)
         self._frames.append(frame)
@@ -199,6 +205,24 @@ class HydrogelStudio:
         self._section_headers, self._frames, self._labels, self._entries, self._buttons = [], [], [], [], []
         s = self.settings
         p = self.profile
+
+        # 고정 영역(시험 시작·정지·비상 정지)을 먼저 배치해 창이 낮아도 공간을 먼저 차지하게 한다. 나머지는 스크롤 영역.
+        self.sidebar_footer = tk.Frame(self.sidebar)
+        self.sidebar_footer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.footer_sep = tk.Frame(self.sidebar, height=1)
+        self.footer_sep.pack(side=tk.BOTTOM, fill=tk.X)
+        self.sidebar_host = tk.Frame(self.sidebar)
+        self.sidebar_host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.sidebar_footer.lift()      # Tab 이동은 쌓임 순서를 따른다. 고정 영역을 스크롤 영역 뒤로 두어 기존 Tab 순서를 유지한다
+        # yscrollincrement는 1이어야 한다. 더 크면 Tk가 증분 단위로만 움직여 내용 맨 아래 몇 픽셀에 닿지 못한다
+        self.sidebar_canvas = tk.Canvas(self.sidebar_host, highlightthickness=0, bd=0, yscrollincrement=1)
+        self.sidebar_canvas.pack(fill=tk.BOTH, expand=True)
+        self.sidebar_inner = tk.Frame(self.sidebar_canvas)
+        self._sidebar_window = self.sidebar_canvas.create_window(0, 0, window=self.sidebar_inner, anchor="nw")
+        self.sidebar_scroll = ttk.Scrollbar(self.sidebar_host, orient=tk.VERTICAL, command=self.sidebar_canvas.yview, style="Hydro.Vertical.TScrollbar")
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scroll.set)
+        self.sidebar_canvas.bind("<Configure>", self._on_sidebar_resize)
+        self.sidebar_inner.bind("<Configure>", self._on_sidebar_resize)
 
         # 연결
         f = self._section("연결")
@@ -257,12 +281,14 @@ class HydrogelStudio:
         self._refresh_dir_label()
         self.distance_var.trace_add("write", lambda *_: self._reset_axes())
 
+        # 여기부터 고정 영역: 작은 화면에서도 비상 정지와 기록 종료를 찾아 스크롤할 일이 없어야 한다
+        f = tk.Frame(self.sidebar_footer, padx=16, pady=2); f.pack(fill=tk.X); self._frames.append(f)
         row = tk.Frame(f); row.pack(fill=tk.X, pady=(10, 0)); self._frames.append(row)
         self.start_button = self._button(row, "▶  시험 시작", self.start_test, kind="accent", side=tk.LEFT, fill=tk.X, expand=True)
         self.stop_button = self._button(row, "■  정지 · 기록 종료", self.stop_test, side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         # 안전 / 전원
-        f = self._section("안전 · 모터 전원")
+        f = self._section("안전 · 모터 전원", parent=self.sidebar_footer)
         self.estop_button = self._button(f, "⛔  비상 정지  (모터 즉시 정지)", self.emergency_stop, kind="danger", fill=tk.X)
         row = tk.Frame(f); row.pack(fill=tk.X, pady=(6, 0)); self._frames.append(row)
         self.motor_off_button = self._button(row, "⏻  모터 전원 OFF", self.motor_off, side=tk.LEFT, fill=tk.X, expand=True)
@@ -270,11 +296,98 @@ class HydrogelStudio:
         hint = tk.Label(f, text="비상 정지(Esc): 이동만 멈추고 위치는 유지.  전원 OFF: 드라이버 차단, 축 자유.", font=(UI_FONT, 8), anchor="w", justify="left", wraplength=316)
         hint.pack(fill=tk.X, pady=(4, 0)); self._labels.append(hint)
 
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        # 두 위젯은 클래스 바인딩이 휠을 따로 처리한다 (콤보박스는 기록 속도 값이 바뀌고, 스크롤바는 두 번 움직인다)
+        self.sample_rate_box.bind("<MouseWheel>", self._on_mousewheel_break)
+        self.sidebar_scroll.bind("<MouseWheel>", self._on_mousewheel_break)
+        self._bind_focus_scroll(self.sidebar_inner)
+
+    # 사이드바 스크롤 ---------------------------------------------------------
+    def _on_sidebar_resize(self, _event=None):
+        canvas = self.sidebar_canvas
+        width = canvas.winfo_width()
+        content_h = self.sidebar_inner.winfo_reqheight()
+        canvas.itemconfigure(self._sidebar_window, width=width)
+        canvas.configure(scrollregion=(0, 0, width, content_h))
+        if content_h > canvas.winfo_height():
+            # 오른쪽 여백(16 px) 위에 겹쳐 놓으므로 내용 폭이 변하지 않아 나타났다 사라졌다 반복하지 않는다
+            self.sidebar_scroll.place(relx=1.0, rely=0, relheight=1.0, width=10, anchor="ne")
+            self.sidebar_scroll.lift()
+        else:
+            self.sidebar_scroll.place_forget()
+            canvas.yview_moveto(0)
+
+    def _on_mousewheel(self, event):
+        # 조그 버튼을 누른 채 스크롤하면 버튼이 포인터에서 벗어날 수 있다
+        if self.closing or self.jogging:
+            return
+        # 열린 콤보박스 목록은 스스로 스크롤한다. event.widget이 문자열일 수 있으므로 경로 글자로만 판단한다
+        if ".popdown" in str(event.widget):
+            return
+        canvas = self.sidebar_canvas
+        x, y = event.x_root - canvas.winfo_rootx(), event.y_root - canvas.winfo_rooty()
+        if not (0 <= x < canvas.winfo_width() and 0 <= y < canvas.winfo_height()):
+            return
+        if self.sidebar_inner.winfo_reqheight() <= canvas.winfo_height():
+            return
+        # 휠 한 칸(120) = 60 px. 터치패드의 작은 값은 현재 Tk(8.6.12)가 120 단위로 모아서 넘겨 주지만,
+        # 다른 Tk에서 그대로 들어와도 0으로 잘려 사라지지 않도록 여기서도 모은다
+        self._wheel_acc += -event.delta / 120 * 60
+        steps = int(self._wheel_acc)
+        self._wheel_acc -= steps
+        if steps:
+            canvas.yview_scroll(steps, "units")
+            self._drop_hidden_focus()
+
+    def _drop_hidden_focus(self):
+        """휠로 입력칸이 가려지면 포커스를 뺀다 (스크롤바를 클릭했을 때와 같다). 숨은 값이 입력되거나 방향키 조그가 말없이 막히는 일을 막는다."""
+        # focus_get()은 콤보박스 목록이 열려 있으면 KeyError가 나므로 Tcl에 직접 묻는다
+        canvas, focused = self.sidebar_canvas, str(self.root.tk.call("focus"))
+        for ent in self._entries:
+            if str(ent) == focused:
+                top = ent.winfo_rooty() - self.sidebar_inner.winfo_rooty()
+                view_top = canvas.canvasy(0)
+                if top < view_top or top + ent.winfo_height() > view_top + canvas.winfo_height():
+                    self.root.focus_set()
+
+    def _on_mousewheel_break(self, event):
+        self._on_mousewheel(event)
+        return "break"
+
+    def _bind_focus_scroll(self, widget):
+        for child in widget.winfo_children():
+            # Frame에는 걸지 않는다. 자식이 포커스를 받으면 조상 Frame에도 FocusIn이 와서 이미 보이는 입력칸을 눌러도 패널이 움직인다
+            if not isinstance(child, tk.Frame):
+                child.bind("<FocusIn>", lambda _e, w=child: self._scroll_into_view(w), add="+")
+            self._bind_focus_scroll(child)
+
+    def _scroll_into_view(self, widget):
+        """Tab으로 화면 밖 입력칸에 들어가 보지 못한 채 입력하는 일이 없도록 위젯이 보이게 스크롤한다."""
+        canvas, inner = self.sidebar_canvas, self.sidebar_inner
+        content_h, view_h = inner.winfo_reqheight(), canvas.winfo_height()
+        if self.jogging or content_h <= view_h:
+            return
+        top = widget.winfo_rooty() - inner.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        view_top = canvas.canvasy(0)
+        if top < view_top:
+            canvas.yview_moveto(max(top - 8, 0) / content_h)
+        elif bottom > view_top + view_h:
+            canvas.yview_moveto(min(bottom + 8 - view_h, content_h - view_h) / content_h)
+
     # 메인 -----------------------------------------------------------------
     def _build_main(self):
         top = tk.Frame(self.main, padx=24, pady=16)
         top.pack(fill=tk.X)
         self._main_frames = [top]
+
+        # 상태 배지가 잘리지 않도록 가장 먼저 배치한다 (pack은 먼저 넣은 위젯부터 공간을 준다).
+        # csv 라벨은 폭을 요구하지 않고(width=1) 지표가 쓰고 남은 공간만 차지한다. 공간이 모자라면 파일 이름의 뒷부분이 보인다
+        right = tk.Frame(top); right.pack(side=tk.RIGHT, fill=tk.X, expand=True); self._main_frames.append(right)
+        self.state_badge = tk.Label(right, text="  READY  ", font=(UI_FONT, 10, "bold"), padx=14, pady=8)
+        self.state_badge.pack(anchor="e")
+        self.csv_label = tk.Label(right, text="", font=(self.colors["mono"], 8), anchor="e", width=1)
+        self.csv_label.pack(fill=tk.X, pady=(6, 0))
 
         left = tk.Frame(top); left.pack(side=tk.LEFT); self._main_frames.append(left)
         cap = tk.Label(left, text="LIVE FORCE", font=(UI_FONT, 8, "bold"), anchor="w"); cap.pack(anchor="w")
@@ -284,18 +397,12 @@ class HydrogelStudio:
         self.grams_label.pack(anchor="w")
         self._captions = [cap]
 
-        mid = tk.Frame(top); mid.pack(side=tk.LEFT, padx=40); self._main_frames.append(mid)
+        mid = tk.Frame(top); mid.pack(side=tk.LEFT, padx=(40, 8)); self._main_frames.append(mid)      # 오른쪽 여백을 줄여 좁은 창에서 값이 덜 잘린다. 넓은 창의 모습은 그대로다
         cap2 = tk.Label(mid, text="PEAK", font=(UI_FONT, 8, "bold"), anchor="w"); cap2.pack(anchor="w")
         self.peak_label = tk.Label(mid, text="0.0000 N", font=(self.colors["mono"], 18), anchor="w"); self.peak_label.pack(anchor="w")
         cap3 = tk.Label(mid, text="DISTANCE / TIME", font=(UI_FONT, 8, "bold"), anchor="w"); cap3.pack(anchor="w", pady=(6, 0))
         self.progress_label = tk.Label(mid, text="0.00 mm  ·  0.0 s", font=(self.colors["mono"], 12), anchor="w"); self.progress_label.pack(anchor="w")
         self._captions += [cap2, cap3]
-
-        right = tk.Frame(top); right.pack(side=tk.RIGHT); self._main_frames.append(right)
-        self.state_badge = tk.Label(right, text="  READY  ", font=(UI_FONT, 10, "bold"), padx=14, pady=8)
-        self.state_badge.pack(anchor="e")
-        self.csv_label = tk.Label(right, text="", font=(self.colors["mono"], 8), anchor="e")
-        self.csv_label.pack(anchor="e", pady=(6, 0))
 
         graph_host = tk.Frame(self.main, padx=16, pady=8)
         graph_host.pack(fill=tk.BOTH, expand=True)
@@ -306,6 +413,13 @@ class HydrogelStudio:
         self.canvas = FigureCanvasTkAgg(self.figure, master=graph_host)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.canvas.get_tk_widget().configure(highlightthickness=0)
+        self.canvas.mpl_connect("resize_event", lambda e: self._set_graph_margins(e.width, e.height))
+        self._set_graph_margins(*self.canvas.get_width_height())
+
+    def _set_graph_margins(self, w, h):
+        """여백을 비율이 아니라 픽셀로 고정한다. 창이 낮아져도 눈금 글자와 x축 이름이 잘리지 않는다."""
+        if w >= 200 and h >= 150:
+            self.figure.subplots_adjust(left=72 / w, right=1 - 18 / w, top=1 - 42 / h, bottom=52 / h)
 
     def _bind_keys(self):
         p = self.profile
@@ -342,6 +456,11 @@ class HydrogelStudio:
             lbl.configure(bg=c["status"], fg=c["status_text"])
         self.sidebar.configure(bg=c["sidebar"])
         self.sidebar_sep.configure(bg=c["border"])
+        for widget in (self.sidebar_host, self.sidebar_canvas, self.sidebar_inner, self.sidebar_footer):
+            widget.configure(bg=c["sidebar"])
+        self.footer_sep.configure(bg=c["border"])
+        self.style.configure("Hydro.Vertical.TScrollbar", troughcolor=c["sidebar"], bordercolor=c["sidebar"], lightcolor=c["sidebar"], darkcolor=c["sidebar"], background=c["muted"], gripcount=0, arrowsize=10)
+        self.style.map("Hydro.Vertical.TScrollbar", background=[("active", c["text"])])
         for h in self._section_headers:
             h.configure(bg=c["sidebar"], fg=c["muted"])
         for fr in self._frames:
@@ -504,6 +623,7 @@ class HydrogelStudio:
         self._message("장비 연결됨. 조그로 접촉 위치를 맞춘 뒤 0점을 잡고 시험을 시작하세요.", "ok")
 
     def disconnect_devices(self):
+        self.jogging = False
         if self.is_running:
             self.stop_test()
         if self._motor_ready():
@@ -560,6 +680,7 @@ class HydrogelStudio:
         if line == "DONE":
             self._on_move_done()
         elif line == "STOP_BUTTON":
+            self.jogging = False
             self._finish_test("STOPPED")
             self._message("하드웨어 비상 정지 버튼이 눌렸습니다.", "warn")
         elif line == "MOTOR_OFF":
@@ -632,7 +753,7 @@ class HydrogelStudio:
         try:
             info = updater.fetch_latest()
         except Exception as exc:
-            self.root.after(0, lambda: self._update_failed(f"버전 확인 실패: {exc}"))
+            self.root.after(0, self._update_failed, f"버전 확인 실패: {exc}")      # lambda 안에서 exc를 쓰면 except가 끝난 뒤 NameError가 난다
             return
         self.root.after(0, lambda: self._update_checked(info))
 
@@ -678,7 +799,7 @@ class HydrogelStudio:
             try:
                 path = updater.download(asset["url"], dest, progress)
             except Exception as exc:
-                self.root.after(0, lambda: self._update_failed(f"다운로드 실패: {exc}"))
+                self.root.after(0, self._update_failed, f"다운로드 실패: {exc}")
                 return
             self.root.after(0, lambda: self._download_done(path, exe))
 
@@ -856,6 +977,8 @@ class HydrogelStudio:
             self.csv_label.configure(text=f"저장됨: {self.csv_path.name}")
 
     def stop_test(self):
+        # 키 뗌을 놓쳐도 플래그가 남지 않게 한다. jog_key_active는 두어야 아직 누른 키의 자동 반복이 조그를 다시 시작하지 않는다
+        self.jogging = False
         if self._motor_ready():
             self.arduino.write(stop_command())
         if self.is_running:
