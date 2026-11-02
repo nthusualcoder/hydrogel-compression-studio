@@ -792,9 +792,9 @@ class HydrogelStudio:
         grams = parse_indicator_grams(line)
         if grams is None:
             return
-        # 인디케이터는 압축 시 음수를 보낸다 → 압축력을 양수 N으로 표시
+        # 인디케이터의 입력 부호를 유지해 N으로 환산한다.
         self.current_grams = grams
-        force = -grams_to_newton(grams) - self.force_offset_N
+        force = grams_to_newton(grams) - self.force_offset_N
         self.force_label.configure(text=f"{force:.4f} N")
         self.grams_label.configure(text=f"{grams:.1f} g (raw)")
         if abs(grams) > self.profile.max_load_g * 0.9:
@@ -1095,7 +1095,7 @@ class HydrogelStudio:
         if self.is_running:
             self._message("시험 중에는 0점을 바꿀 수 없습니다. 바꾸면 기록된 힘이 어긋납니다.", "warn")
             return
-        self.force_offset_N = -grams_to_newton(self.current_grams)
+        self.force_offset_N = grams_to_newton(self.current_grams)
         self.force_label.configure(text="0.0000 N")
         self._live_distance = 0.0
         self.stress_label.configure(text="0.000 kPa  ·  0.0 %")

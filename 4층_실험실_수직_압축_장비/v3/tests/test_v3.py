@@ -173,7 +173,7 @@ class AppTests(unittest.TestCase):
         self.loadcell.queue_line("-40.0\n")  # 간격 경과 후 도착 → 평균 기록
         self.pump(0.1)
         self.assertEqual(len(self.app.force_data), 1)
-        self.assertAlmostEqual(self.app.force_data[-1], grams_to_newton(25.0), places=6)
+        self.assertAlmostEqual(self.app.force_data[-1], grams_to_newton(-25.0), places=6)
         self.app.stop_button.invoke()        # 종료 시 남은 버킷은 없음
         self.assertEqual(len(self.app.force_data), 1)
 
@@ -262,7 +262,7 @@ class AppTests(unittest.TestCase):
         self.app.speed_var.set("1")
         self.app.start_button.invoke()
         self.assertEqual(self.motor.writes[-1], b"start,2,1\n")
-        self.loadcell.queue_line("   -10.0\r\n")     # 압축 → 음수 g → +N
+        self.loadcell.queue_line("   +10.0\r\n")     # 입력 부호 유지: 양수 g → +N
         self.pump()
         self.assertAlmostEqual(self.app.force_data[-1], grams_to_newton(10.0), places=6)
         self.motor.queue_line("DONE\n")
@@ -275,6 +275,28 @@ class AppTests(unittest.TestCase):
         self.assertTrue(text[0].startswith("# specimen: cylinder, diameter_mm=10, height0_mm=5, area_mm2=78.5398, mode=COMPRESSION, stress=engineering F/A0"))
         self.assertEqual(text[1], "Time (s),Distance (mm),Force (N),Strain (-),Stress (kPa)")
         self.assertEqual(len(text), 3)
+        self.assertAlmostEqual(float(text[2].split(",")[2]), round(grams_to_newton(10.0), 4))
+
+    def test_loadcell_preserves_both_signs_and_zero_offset(self):
+        for raw in (-10.0, 10.0):
+            with self.subTest(raw=raw):
+                self.app.force_offset_N = 0.0
+                self.app._on_loadcell_line(f"{raw:+.1f}")
+                self.assertEqual(self.app.force_label.cget("text"), f"{grams_to_newton(raw):.4f} N")
+                self.app.zero_force()
+                self.assertAlmostEqual(self.app.force_offset_N, grams_to_newton(raw))
+                self.app._on_loadcell_line(f"{raw:+.1f}")
+                self.assertEqual(self.app.force_label.cget("text"), "0.0000 N")
+                self.app._on_loadcell_line(f"{raw + 5:+.1f}")
+                self.assertEqual(self.app.force_label.cget("text"), f"{grams_to_newton(5):.4f} N")
+        self.app.force_offset_N = 0.0
+        self.app.start_button.invoke()
+        self.app._on_loadcell_line("-10.0")
+        self.assertAlmostEqual(self.app.force_data[-1], grams_to_newton(-10.0))
+        self.assertLess(self.app.stress_data[-1], 0)
+        self.app.stop_button.invoke()
+        row = self.app.csv_path.read_text(encoding="utf-8-sig").splitlines()[2].split(",")
+        self.assertAlmostEqual(float(row[2]), round(grams_to_newton(-10.0), 4))
 
     def test_stress_strain_and_modulus(self):
         import math
@@ -285,7 +307,7 @@ class AppTests(unittest.TestCase):
         self.app.start_button.invoke()
         self.app.start_time -= 100                # 이미 목표 거리에 도달한 것처럼 → strain 0.2 고정
         self.assertAlmostEqual(self.app.area_mm2, math.pi * 25, places=6)
-        self.loadcell.queue_line("-10.0\n")     # 0.0980665 N
+        self.loadcell.queue_line("+10.0\n")     # 0.0980665 N
         self.pump()
         self.assertAlmostEqual(self.app.strain_data[-1], 0.2, places=6)
         expected_kPa = 0.0980665 / (math.pi * 25e-6) / 1000
