@@ -47,7 +47,7 @@ def motor_on_command() -> bytes:
 def parse_indicator_grams(line: str) -> float | None:
     """CI-1580A 출력 한 줄에서 g 단위 값을 읽는다.
 
-    인디케이터는 'xxx.x' 형식(0.1 = 0.1 g)으로 보내며, 압축 시 음수가 된다.
+    인디케이터는 'xxx.x' 형식(0.1 = 0.1 g)으로 보내며, 입력 부호를 유지한다.
     단위 문자가 있어도 무시하고 첫 번째 숫자를 사용한다.
     """
     match = _NUMBER.search(line)

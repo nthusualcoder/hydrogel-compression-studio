@@ -51,7 +51,7 @@ class DemoRig:
     """하드웨어 없이 UI를 확인하기 위한 가상 모터·로드셀.
 
     - 모터 포트: start/조그/STOP/MOFF/MON 명령을 받아 DONE 등 응답을 돌려준다.
-    - 로드셀 포트: 10 Hz로 'xxx.x' 형식(g)의 값을 보낸다. 누르는 동안 음수로 증가한다.
+    - 로드셀 포트: 10 Hz로 'xxx.x' 형식(g)의 값을 보낸다. 누르는 동안 양수로 증가한다.
     """
 
     def __init__(self, press_cmd, release_cmd):
@@ -111,9 +111,9 @@ class DemoRig:
                     self.remaining = None
                     self.velocity = 0.0
                     self.motor.queue_line("DONE\n")
-            # 가상 하이드로젤(D10 H5, E≈20 kPa 가정): 0.2 mm 이후 접촉, 이후 거리에 따라 하중 증가 (음수 = 압축)
+            # 가상 하이드로젤(D10 H5, E≈20 kPa 가정): 0.2 mm 이후 접촉, 이후 거리에 따라 양수 하중 증가
             contact = max(0.0, self.position_mm - 0.2)
-            grams = -(contact * 32.0 + contact ** 3 * 4.0) + math.sin(time.time() * 7) * 0.05
+            grams = (contact * 32.0 + contact ** 3 * 4.0) + math.sin(time.time() * 7) * 0.05
             self.indicator.queue_line(f"{grams:8.1f}\r\n")
             time.sleep(dt)
 

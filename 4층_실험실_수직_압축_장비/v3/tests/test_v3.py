@@ -143,6 +143,173 @@ class AppTests(unittest.TestCase):
         self.assertEqual(str(self.app.update_button.cget("state")), tk.NORMAL)
         self.assertIn("offline", self.app.sb_message.cget("text"))
 
+    def test_start_point_fixed_speed_threshold_stop_then_zero(self):
+        a = self.app
+        self.assertEqual(a.start_force_var.get(), "0.01")
+        a.jog_speed_var.set("5")
+        self.loadcell.queue_line("0.0\n"); self.pump()
+        a.start_point_button.invoke()
+        self.assertEqual(self.motor.writes[-1], b"JU,0.01\n")
+        self.loadcell.queue_line("1.0\n"); self.pump()
+        self.assertEqual(a._starting_point, "seeking")  # 1 g = 0.00980665 N < 0.01 N
+        self.loadcell.queue_line("1.1\n"); self.pump()
+        self.assertEqual(self.motor.writes[-1], b"STOP\n")
+        self.assertEqual(a._starting_point, "stopping")
+        self.assertEqual(a.force_offset_N, 0.0)
+        self.motor.queue_line("STOPPED\n"); self.pump()
+        self.assertEqual(a._starting_point, "zeroing")
+        self.loadcell.queue_line("1.2\n"); self.pump()
+        self.assertIsNone(a._starting_point)
+        self.assertEqual(a._state, "START SET")
+        self.assertAlmostEqual(a.force_offset_N, grams_to_newton(1.2))
+        self.assertEqual(a.force_label.cget("text"), "0.0000 N")
+        self.assertIsNone(a.csv_path)
+        self.assertFalse(a.is_running)
+        self.assertEqual(str(a.start_point_button.cget("state")), tk.NORMAL)
+
+    def test_start_point_custom_threshold_uses_displayed_force_and_saves(self):
+        a = self.app
+        a._on_loadcell_line("10")
+        a.zero_force()
+        a.start_force_var.set("0.02")
+        a.find_start_point()
+        self.assertEqual(load_settings(a.config_path).start_force, "0.02")
+        a._on_loadcell_line("12")
+        self.assertEqual(a._starting_point, "seeking")
+        a._on_loadcell_line("12.1")
+        self.assertEqual(a._starting_point, "stopping")
+        self.assertAlmostEqual(a.force_offset_N, grams_to_newton(10))
+
+    def test_start_point_rejects_bad_threshold_or_missing_data(self):
+        a = self.app
+        a.find_start_point()
+        self.assertEqual(self.motor.writes, [])
+        a._on_loadcell_line("0")
+        for value in ("0", "-0.01", "nan", "inf", "abc", "20"):
+            with self.subTest(value=value):
+                a.start_force_var.set(value)
+                a.find_start_point()
+                self.assertIsNone(a._starting_point)
+                self.assertEqual(self.motor.writes, [])
+        a.start_force_var.set("0.01")
+        a._last_loadcell_at -= 3
+        a.find_start_point()
+        self.assertEqual(self.motor.writes, [])
+        a._on_loadcell_line("0")
+        self.loadcell.is_open = False
+        a.find_start_point()
+        self.assertEqual(self.motor.writes, [])
+
+    def test_start_point_already_loaded_does_not_advance(self):
+        a = self.app
+        a._on_loadcell_line("2")
+        a.find_start_point()
+        self.assertEqual(self.motor.writes, [b"STOP\n"])
+        self.assertEqual(a._starting_point, "stopping")
+
+    def test_start_point_blocks_other_motion_and_zeroing(self):
+        a = self.app
+        a._on_loadcell_line("0")
+        a.find_start_point()
+        sent = list(self.motor.writes)
+        for fn in (a.start_test, lambda: a.start_jog("JD"), a.zero_force, a.motor_on, a.find_start_point, a.check_for_update):
+            fn()
+        self.assertEqual(self.motor.writes, sent)
+        self.assertFalse(a.is_running)
+        self.assertIsNone(a.csv_path)
+        self.assertEqual(a.force_offset_N, 0.0)
+        for widget in (a.start_button, a.zero_button, a.start_force_entry, a.start_point_button):
+            self.assertEqual(str(widget.cget("state")), tk.DISABLED)
+        a.stop_test()
+        a.start_test()
+        self.assertTrue(a.is_running)
+        sent = list(self.motor.writes)
+        a.find_start_point()
+        self.assertEqual(self.motor.writes, sent)
+
+    def test_start_point_cancel_paths_do_not_zero(self):
+        a = self.app
+        for stop in (a.stop_test, a.emergency_stop, a.motor_off, lambda: a._on_motor_line("STOP_BUTTON"), a.disconnect_devices):
+            with self.subTest(stop=stop):
+                a._on_loadcell_line("0")
+                a.find_start_point()
+                a._on_loadcell_line("1.1")
+                stop()
+                self.assertIsNone(a._starting_point)
+                a._on_motor_line("STOPPED")
+                a._on_loadcell_line("2")
+                self.assertEqual(a.force_offset_N, 0.0)
+
+    def test_start_point_stale_data_or_missing_stop_ack_aborts(self):
+        a = self.app
+        a._on_loadcell_line("0")
+        a.find_start_point()
+        a._last_loadcell_at -= 3
+        a._check_start_point()
+        self.assertIsNone(a._starting_point)
+        self.assertEqual(self.motor.writes[-1], b"STOP\n")
+        a._on_loadcell_line("0")
+        a.find_start_point()
+        a._on_loadcell_line("1.1")
+        a._start_phase_at -= 3
+        a._check_start_point()
+        self.assertIsNone(a._starting_point)
+        self.assertEqual(a.force_offset_N, 0.0)
+
+    def test_start_point_overload_serial_error_and_stale_packets_abort(self):
+        a = self.app
+        for reason in ("overload", "serial_error", "stale_packet", "closed_port"):
+            with self.subTest(reason=reason):
+                a._on_loadcell_line("0")
+                a.find_start_point()
+                if reason == "overload":
+                    a._on_loadcell_line("1900")
+                elif reason == "serial_error":
+                    a.rx_queue.put(("serial_error", "loadcell: disconnected", time.monotonic()))
+                    a._pump_queue()
+                elif reason == "stale_packet":
+                    a._on_loadcell_line("2", time.monotonic() - 3)
+                else:
+                    self.loadcell.is_open = False
+                    a._check_start_point()
+                self.assertIsNone(a._starting_point)
+                self.assertEqual(self.motor.writes[-1], b"STOP\n")
+                self.assertEqual(a.force_offset_N, 0.0)
+
+    def test_start_point_ignores_old_stop_ack_and_pre_stop_load(self):
+        a = self.app
+        a._on_loadcell_line("0")
+        a.find_start_point()
+        a._on_loadcell_line("1.1")
+        a._on_motor_line("STOPPED", a._start_phase_at - 1)
+        self.assertEqual(a._starting_point, "stopping")
+        a._on_motor_line("STOPPED")
+        a._on_loadcell_line("1.2", a._start_phase_at - 0.1)
+        self.assertEqual(a._starting_point, "zeroing")
+        self.assertEqual(a.force_offset_N, 0.0)
+        a._on_loadcell_line("1.3")
+        self.assertIsNone(a._starting_point)
+        self.assertAlmostEqual(a.force_offset_N, grams_to_newton(1.3))
+
+    def test_start_point_demo_completes_stop_and_zero(self):
+        a = self.app
+        a.disconnect_devices()
+        a.demo = True
+        a.connect_devices()
+        a.demo_rig.position_mm = 0.23  # 접촉 직전: 약 0.96 g
+        self.pump(0.2)
+        a.find_start_point()
+        deadline = time.monotonic() + 4
+        while a._starting_point and time.monotonic() < deadline:
+            self.pump(0.1)
+        self.assertIsNone(a._starting_point)
+        self.assertEqual(a._state, "START SET")
+        self.assertEqual(a.demo_rig.velocity, 0.0)
+        self.assertIn(b"JU,0.01\n", a.arduino.writes)
+        self.assertEqual(a.arduino.writes[-1], b"STOP\n")
+        self.assertGreater(a.force_offset_N, 0)
+        self.assertLess(abs(float(a.force_label.cget("text").split()[0])), 0.002)
+
     def test_download_failure_reaches_handler(self):
         class RunNow:       # mainloop 밖에서는 다른 스레드가 after를 쓸 수 없으므로 바로 실행한다
             def __init__(self, target, daemon=None):
@@ -590,11 +757,12 @@ class SmallScreenTests(unittest.TestCase):
         x = bar.winfo_width() // 2
         self.assertTrue(bar.identify(x, 5).endswith("thumb"))
         bar.event_generate("<ButtonPress-1>", x=x, y=5)
+        expected_shift = bar.delta(0, 100) * self.app.sidebar_inner.winfo_reqheight()
         bar.event_generate("<B1-Motion>", x=x, y=105)
         bar.event_generate("<ButtonRelease-1>", x=x, y=105)
         self.settle()
         content_h = self.app.sidebar_inner.winfo_reqheight()
-        self.assertAlmostEqual(self.view_top(), 100 / bar.winfo_height() * content_h, delta=3)
+        self.assertAlmostEqual(self.view_top(), expected_shift, delta=3)
         self.scroll_to(0.0)
         y = bar.winfo_height() - 3
         self.assertTrue(bar.identify(x, y).endswith("trough"))
@@ -650,8 +818,8 @@ class SmallScreenTests(unittest.TestCase):
         a = self.app
         e = a._entries
         expected = [e[0], e[1], a.disconnect_button, a.save_defaults_button, e[2], a.press_button, a.release_button,
-                    a.zero_button, a._radios[0], a._radios[1], e[3], e[4], e[5], e[6], a._radios[2], a._radios[3],
-                    a.sample_rate_box, e[7], a.dir_button, a.start_button, a.stop_button, a.estop_button,
+                    a.zero_button, e[3], a.start_point_button, a._radios[0], a._radios[1], e[4], e[5], e[6], e[7], a._radios[2], a._radios[3],
+                    a.sample_rate_box, e[8], a.dir_button, a.start_button, a.stop_button, a.estop_button,
                     a.motor_off_button, a.motor_on_button]
         w, order = e[0], []
         for _ in expected:
@@ -1012,12 +1180,13 @@ class SmallScreenTests(unittest.TestCase):
                         self.assertGreaterEqual(w.winfo_width(), w.winfo_reqwidth())
         a._set_state("READY")
 
-    def test_default_size_needs_no_scrollbar(self):
-        """큰 화면의 기본 창에서는 막대 없이 예전 글자 크기로 전부 보인다."""
+    def test_default_size_keeps_controls_readable_and_reachable(self):
+        """Starting point 추가 후에도 기본 글자 크기를 유지하고 아래쪽 설정까지 스크롤된다."""
         a = self.app
         self.resize(*DEFAULT_SIZE)
-        self.assertFalse(a.sidebar_scroll.winfo_ismapped())
+        self.assertTrue(a.sidebar_scroll.winfo_ismapped())
         self.assertFalse(a._compact)
+        self.scroll_to(1.0)
         last = a.sidebar_inner.winfo_children()[-1]
         self.assertLessEqual(last.winfo_rooty() + last.winfo_height(), self.canvas.winfo_rooty() + self.canvas.winfo_height())
         self.assertEqual(self.font_size(a.force_label), 34)

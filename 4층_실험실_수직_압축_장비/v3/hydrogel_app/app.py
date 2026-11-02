@@ -38,6 +38,8 @@ SAMPLE_RATE_OPTIONS = ("0", "10", "5", "2", "1", "0.5", "0.2")   # samples/s, 0 
 MODULUS_CAPTION = "COMPRESSIVE MODULUS  (linear fit, 5-15 % strain)"
 MODULUS_CAPTION_COMPACT = "MODULUS (5-15 %)"
 CSV_LABEL_PACK = {"fill": tk.X, "pady": (6, 0)}
+START_POINT_SPEED = 0.01       # mm/s, 탐색 속도 고정
+START_POINT_TIMEOUT = 2.0      # 유효 하중 수신 / 정지 응답 대기 상한(초)
 
 
 class HydrogelStudio:
@@ -76,6 +78,10 @@ class HydrogelStudio:
         self.is_running = False          # 기록 중
         self.motor_moving = False        # 자동 이동 중
         self.jogging = False
+        self._starting_point = None   # None / seeking / stopping / zeroing
+        self._start_phase_at = 0.0
+        self._last_loadcell_at = 0.0
+        self._start_force_N = 0.01
         self.current_grams = 0.0
         self.force_offset_N = 0.0
         self.peak_force_N = 0.0
@@ -256,6 +262,9 @@ class HydrogelStudio:
             btn.bind("<ButtonPress-1>", lambda _e, c=cmd: self.start_jog(c))
             btn.bind("<ButtonRelease-1>", lambda _e: self.stop_jog())
         self.zero_button = self._button(f, "⚖  현재 하중을 0점으로", self.zero_force, fill=tk.X, pady=(6, 0))
+        self.start_force_var = tk.StringVar(value=s.start_force)
+        self.start_force_entry = self._row(f, "Starting point 하중 (N)", self.start_force_var)
+        self.start_point_button = self._button(f, "Starting point 찾기 · 0.01 mm/s", self.find_start_point, fill=tk.X, pady=(4, 0))
 
         # 시험 설정
         f = self._section("시험 설정")
@@ -640,6 +649,7 @@ class HydrogelStudio:
         color = {
             "READY": c["muted"], "RUNNING": c["blue"], "HOLDING": c["yellow"], "DONE": c["green"],
             "STOPPED": c["yellow"], "E-STOP": c["red"], "MOTOR OFF": c["red"], "JOG": c["yellow"],
+            "FINDING": c["yellow"], "STOPPING": c["yellow"], "ZEROING": c["yellow"], "START SET": c["green"],
         }.get(state, c["muted"])
         self.state_badge.configure(text=f"  {state}  ", bg=color, fg="#ffffff" if c["name"] == "dark" or state in ("E-STOP", "MOTOR OFF") else "#000000")
 
@@ -675,6 +685,7 @@ class HydrogelStudio:
             sample_rate=self.sample_rate_var.get().strip(),
             diameter=self.diameter_var.get().strip(),
             height=self.height_var.get().strip(),
+            start_force=self.start_force_var.get().strip(),
         )
         path = save_settings(self.settings, self.config_path)
         if not quiet:
@@ -721,6 +732,8 @@ class HydrogelStudio:
         self._message("장비 연결됨. 조그로 접촉 위치를 맞춘 뒤 0점을 잡고 시험을 시작하세요.", "ok")
 
     def disconnect_devices(self):
+        self._set_start_point_phase(None)
+        self._last_loadcell_at = 0.0
         self.jogging = False
         if self.is_running:
             self.stop_test()
@@ -753,52 +766,83 @@ class HydrogelStudio:
         while device and getattr(device, "is_open", False) and not self.closing:
             try:
                 line = device.readline().decode("utf-8", errors="ignore").strip()
-            except Exception:
+            except Exception as exc:
+                self.rx_queue.put(("serial_error", f"{tag}: {exc}", time.monotonic()))
                 break
             if line:
-                self.rx_queue.put((tag, line))
+                self.rx_queue.put((tag, line, time.monotonic()))
 
     def _pump_queue(self):
         if self.closing:
             return
         while True:
             try:
-                tag, line = self.rx_queue.get_nowait()
+                tag, line, received_at = self.rx_queue.get_nowait()
             except queue.Empty:
                 break
             if tag == "loadcell":
-                self._on_loadcell_line(line)
+                self._on_loadcell_line(line, received_at)
+            elif tag == "serial_error":
+                if self._starting_point:
+                    self._stop_start_point(f"탐색 중 통신 오류: {line}", "error")
             else:
-                self._on_motor_line(line)
+                self._on_motor_line(line, received_at)
+        self._check_start_point()
         self._check_move_timeout()
         self._schedule(30, self._pump_queue)
 
     # ------------------------------------------------------------------ 수신 처리
-    def _on_motor_line(self, line):
+    def _on_motor_line(self, line, received_at=None):
+        received_at = time.monotonic() if received_at is None else received_at
+        if line == "STOPPED" and self._starting_point == "stopping" and received_at >= self._start_phase_at:
+            self._set_start_point_phase("zeroing")
+            self._set_state("ZEROING")
+            self._message("정지 확인. 다음 하중을 받아 자동으로 0점을 설정합니다.")
+            return
         if line == "DONE":
             self._on_move_done()
         elif line == "STOP_BUTTON":
+            self._set_start_point_phase(None)
             self.jogging = False
             self._finish_test("STOPPED")
             self._message("하드웨어 비상 정지 버튼이 눌렸습니다.", "warn")
         elif line == "MOTOR_OFF":
+            if self._starting_point:
+                self._stop_start_point("모터 전원이 꺼져 탐색을 취소했습니다.", "warn")
             self.motor_enabled = False
             self._refresh_motor_status()
         elif line == "MOTOR_ON":
             self.motor_enabled = True
             self._refresh_motor_status()
 
-    def _on_loadcell_line(self, line):
+    def _on_loadcell_line(self, line, received_at=None):
         grams = parse_indicator_grams(line)
         if grams is None:
             return
+        received_at = time.monotonic() if received_at is None else received_at
+        self._last_loadcell_at = received_at
         # 인디케이터의 입력 부호를 유지해 N으로 환산한다.
         self.current_grams = grams
         force = grams_to_newton(grams) - self.force_offset_N
         self.force_label.configure(text=f"{force:.4f} N")
         self.grams_label.configure(text=f"{grams:.1f} g (raw)")
         if abs(grams) > self.profile.max_load_g * 0.9:
+            if self._starting_point:
+                self._stop_start_point("로드셀 용량 90% 초과로 탐색을 중지했습니다.", "error")
+                return
             self._message(f"하중이 로드셀 용량({self.profile.loadcell})의 90%를 넘었습니다!", "error")
+        if self._starting_point:
+            if time.monotonic() - received_at > START_POINT_TIMEOUT:
+                self._stop_start_point("하중 데이터가 지연되어 탐색을 중지했습니다.", "error")
+                return
+            if self._starting_point == "seeking" and force >= self._start_force_N:
+                self._request_start_point_stop()
+            elif self._starting_point == "zeroing" and received_at >= self._start_phase_at:
+                self._set_start_point_phase(None)
+                self.zero_force()
+                self._set_state("START SET")
+                self._message("Starting point 설정 완료. 정지 후 하중을 0점으로 맞췄습니다.", "ok")
+                return
         if self.is_running:
             self._live_distance = self._commanded_distance()
             self._show_live_stress(force, self._live_distance, self.area_mm2, self.height0_mm)
@@ -904,6 +948,9 @@ class HydrogelStudio:
 
     # ------------------------------------------------------------------ GitHub 업데이트
     def check_for_update(self):
+        if self._starting_point:
+            self._message("Starting point 탐색을 정지한 뒤 업데이트를 확인하세요.", "warn")
+            return
         self.update_button.configure(state=tk.DISABLED, text="⬇  확인 중…")
         self._message("GitHub에서 최신 버전을 확인하는 중…")
         threading.Thread(target=self._check_update_worker, daemon=True).start()
@@ -967,14 +1014,14 @@ class HydrogelStudio:
     def _download_done(self, path, exe):
         self.update_button.configure(state=tk.NORMAL, text=f"⬇  업데이트 확인  (v{__version__})")
         self._message(f"다운로드 완료: {path}", "ok")
-        if exe and not self.is_running and self.show_dialogs and messagebox.askyesno(
+        if exe and not self.is_running and not self._starting_point and self.show_dialogs and messagebox.askyesno(
             "업데이트 설치",
             f"다운로드했습니다:\n{path}\n\n지금 프로그램을 닫고 새 버전으로 교체한 뒤 다시 실행할까요?\n(기존 파일은 .bak 으로 남습니다. 시험 중이면 '아니오'를 누르세요.)",
             parent=self.root,
         ):
             updater.replace_and_restart(path, exe)
             self.close()
-        elif self.is_running:
+        elif self.is_running or self._starting_point:
             self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n시험이 끝난 뒤 프로그램을 닫고 이 파일로 바꿔 실행하세요.")
         elif not exe:
             self._notify("showinfo", "업데이트", f"새 exe를 저장했습니다:\n{path}\n(개발 환경에서는 자동 교체를 하지 않습니다.)")
@@ -1042,6 +1089,89 @@ class HydrogelStudio:
             self._message("목표 거리 도달. 변위를 유지하며 하중을 계속 기록합니다. 끝내려면 '정지 · 기록 종료'를 누르세요.", "info")
 
     # ------------------------------------------------------------------ 조그
+    def _set_start_point_phase(self, phase):
+        if phase is None and self._starting_point is None:
+            return
+        self._starting_point = phase
+        self._start_phase_at = time.monotonic()
+        state = tk.DISABLED if phase else tk.NORMAL
+        for widget in (self.start_point_button, self.start_force_entry, self.start_button,
+                       self.press_button, self.release_button, self.zero_button, self.motor_on_button,
+                       self.dir_button, self.save_defaults_button, self.update_button):
+            widget.configure(state=state)
+
+    def find_start_point(self):
+        if self._starting_point or self.is_running or self.jogging or self.motor_moving:
+            self._message("이동 또는 시험을 먼저 정지하세요.", "warn")
+            return
+        if not self._motor_ready() or not self.indicator or not self.indicator.is_open:
+            self._message("모터와 로드셀을 먼저 연결하세요.", "warn")
+            return
+        if time.monotonic() - self._last_loadcell_at > START_POINT_TIMEOUT:
+            self._message("최근 하중 데이터가 없습니다. 로드셀 수신을 확인하세요.", "warn")
+            return
+        if str(self.update_button.cget("state")) == tk.DISABLED:
+            self._message("업데이트 확인 또는 다운로드가 끝난 뒤 탐색하세요.", "warn")
+            return
+        try:
+            force = float(self.start_force_var.get())
+            max_force = grams_to_newton(self.profile.max_load_g * 0.9)
+            if not math.isfinite(force) or not 0 < force < max_force:
+                raise ValueError(f"Starting point 하중은 0보다 크고 {max_force:.3f} N보다 작아야 합니다.")
+            self._save_settings(quiet=True)
+        except (ValueError, OSError) as exc:
+            self._message(str(exc), "error")
+            return
+        if abs(self.current_grams) > self.profile.max_load_g * 0.9:
+            self._message("하중이 로드셀 용량의 90%를 넘었습니다. 탐색할 수 없습니다.", "error")
+            return
+        self._start_force_N = force
+        self._set_start_point_phase("seeking")
+        if grams_to_newton(self.current_grams) - self.force_offset_N >= force:
+            self._request_start_point_stop()
+            return
+        try:
+            self.arduino.write(jog_command(self.profile.press_cmd, START_POINT_SPEED))
+        except Exception as exc:
+            self._stop_start_point(f"탐색 시작 실패: {exc}", "error")
+            return
+        self.motor_enabled = True
+        self._refresh_motor_status()
+        self._set_state("FINDING")
+        self._message(f"Starting point 탐색: {force:g} N 이상에서 정지 · 속도 {START_POINT_SPEED:g} mm/s")
+
+    def _request_start_point_stop(self):
+        self._set_start_point_phase("stopping")
+        try:
+            self.arduino.write(stop_command())
+        except Exception as exc:
+            self._stop_start_point(f"정지 명령 전송 실패: {exc}", "error")
+            return
+        self._set_state("STOPPING")
+        self._message("기준 하중 도달. 모터의 정지 응답을 기다립니다.")
+
+    def _stop_start_point(self, message, level="warn"):
+        self._set_start_point_phase(None)
+        try:
+            if self._motor_ready():
+                self.arduino.write(stop_command())
+        except Exception as exc:
+            message += f" 정지 명령 전송 실패: {exc}"
+            level = "error"
+        self._set_state("STOPPED")
+        self._message(message, level)
+
+    def _check_start_point(self):
+        if not self._starting_point:
+            return
+        now = time.monotonic()
+        if not self._motor_ready() or not self.indicator or not self.indicator.is_open:
+            self._stop_start_point("연결이 끊겨 탐색을 중지했습니다.", "error")
+        elif now - self._last_loadcell_at > START_POINT_TIMEOUT:
+            self._stop_start_point("2초 동안 유효한 하중이 없어 탐색을 중지했습니다.", "error")
+        elif self._starting_point != "seeking" and now - self._start_phase_at > START_POINT_TIMEOUT:
+            self._stop_start_point("정지 또는 0점 설정 응답 시간이 초과되었습니다.", "error")
+
     def _on_key_press(self, cmd, event):
         if isinstance(event.widget, tk.Entry):
             return
@@ -1065,6 +1195,9 @@ class HydrogelStudio:
         self.stop_jog()
 
     def start_jog(self, cmd):
+        if self._starting_point:
+            self._message("Starting point 탐색 중에는 수동 이동을 사용할 수 없습니다.", "warn")
+            return
         if not self._motor_ready():
             self._message("장비가 연결되어 있지 않습니다.", "warn")
             return
@@ -1092,6 +1225,9 @@ class HydrogelStudio:
         self._set_state("READY" if not self.is_running else self._state)
 
     def zero_force(self):
+        if self._starting_point:
+            self._message("Starting point 탐색 중에는 0점을 바꿀 수 없습니다.", "warn")
+            return
         if self.is_running:
             self._message("시험 중에는 0점을 바꿀 수 없습니다. 바꾸면 기록된 힘이 어긋납니다.", "warn")
             return
@@ -1103,6 +1239,9 @@ class HydrogelStudio:
 
     # ------------------------------------------------------------------ 시험
     def start_test(self):
+        if self._starting_point:
+            self._message("Starting point 탐색을 완료하거나 정지한 뒤 시험을 시작하세요.", "warn")
+            return
         if not self._motor_ready():
             self._message("장비를 먼저 연결하세요.", "warn")
             self._notify("showwarning", "연결 필요", "장비를 먼저 연결하세요.")
@@ -1186,6 +1325,9 @@ class HydrogelStudio:
             self.csv_label.configure(text=f"저장됨: {self.csv_path.name}")
 
     def stop_test(self):
+        if self._starting_point:
+            self._stop_start_point("Starting point 탐색을 취소했습니다.")
+            return
         # 키 뗌을 놓쳐도 플래그가 남지 않게 한다. jog_key_active는 두어야 아직 누른 키의 자동 반복이 조그를 다시 시작하지 않는다
         self.jogging = False
         if self._motor_ready():
@@ -1197,6 +1339,7 @@ class HydrogelStudio:
             self._set_state("READY")
 
     def emergency_stop(self):
+        self._set_start_point_phase(None)
         self.jogging = False
         self.jog_key_active = None
         if self._motor_ready():
@@ -1205,6 +1348,7 @@ class HydrogelStudio:
         self._message("비상 정지: 모터 이동을 멈췄습니다. 드라이버는 현재 위치를 유지합니다.", "warn")
 
     def motor_off(self):
+        self._set_start_point_phase(None)
         if not self._motor_ready():
             self._message("장비가 연결되어 있지 않습니다.", "warn")
             return
@@ -1216,6 +1360,8 @@ class HydrogelStudio:
         self._message("모터 전원 OFF: 드라이버 전원을 차단했습니다. 축이 자유롭게 움직일 수 있습니다.", "warn")
 
     def motor_on(self):
+        if self._starting_point:
+            return
         if not self._motor_ready():
             self._message("장비가 연결되어 있지 않습니다.", "warn")
             return

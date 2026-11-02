@@ -19,6 +19,7 @@ class AppSettings:
     sample_rate: str = "10"   # 초당 기록 수. "0" = 인디케이터 원본 전부
     diameter: str = "10"     # 시편 직경 mm (원통형)
     height: str = "5"        # 시편 초기 높이 mm
+    start_force: str = "0.01"  # Starting point 정지 하중 N
 
 
 def default_config_path(device_key: str) -> Path:
