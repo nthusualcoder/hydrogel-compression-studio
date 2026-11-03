@@ -27,6 +27,7 @@ from .protocol import (
     stop_command,
 )
 from .serial_io import DemoRig, open_serial
+from .step_log import StepLog
 from .theme import THEMES
 from . import updater
 from .motion import move_duration, position_at
@@ -109,6 +110,10 @@ class HydrogelStudio:
         self._live_distance = 0.0     # 마지막으로 계산한 명령 위치(mm), 시험 후 표시용
         self._wheel_acc = 0.0         # 한 칸보다 작은 휠 값을 모으는 누적기(px)
         self._compact = False         # 메인 상단 지표 축소 표시 여부
+        self._step_log = None
+        self._step_log_phase = None
+        self._step_log_phase_at = 0.0
+        self.step_log_path = None
 
         self._build()
         self._apply_theme()
@@ -249,7 +254,9 @@ class HydrogelStudio:
         self.connect_button = self._button(row, "장비 연결", self.connect_devices, kind="accent", side=tk.LEFT, fill=tk.X, expand=True)
         self.disconnect_button = self._button(row, "연결 해제", self.disconnect_devices, side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         self.disconnect_button.config(state=tk.DISABLED)
-        self.save_defaults_button = self._button(f, "현재 설정을 기본값으로 저장", self.save_defaults, fill=tk.X, pady=(6, 0))
+        row = tk.Frame(f); row.pack(fill=tk.X, pady=(6, 0)); self._frames.append(row)
+        self.save_defaults_button = self._button(row, "현재 설정을 기본값으로 저장", self.save_defaults, side=tk.LEFT, fill=tk.X, expand=True)
+        self.step_log_button = self._button(row, "STEP 로그", self.toggle_step_log, side=tk.RIGHT, padx=(6, 0))
 
         # 수동 제어
         f = self._section(f"수동 제어  ·  키보드 {p.press_key}/{p.release_key}")
@@ -709,6 +716,75 @@ class HydrogelStudio:
             self.save_dir_var.set(selected)
 
     # ------------------------------------------------------------------ 연결
+    def _write_motor(self, command):
+        sent_at = time.monotonic()
+        result = self.arduino.write(command)
+        self._step_log_record("TX", sent_at, detail=command.decode("ascii", errors="replace").strip(),
+                              write_duration_us=round((time.monotonic() - sent_at) * 1_000_000))
+        return result
+
+    def _step_log_record(self, event, received_at=None, **values):
+        if self._step_log:
+            try:
+                self._step_log.record(event, received_at, **values)
+            except OSError as exc:
+                self._end_step_log(f"저장 실패: {exc}", error=True, send_off=True)
+
+    def toggle_step_log(self):
+        if self._step_log:
+            try:
+                self._step_log_phase = "stopping"
+                self._step_log_phase_at = time.monotonic()
+                self.step_log_button.configure(state=tk.DISABLED)
+                self._write_motor(b"DIAG,OFF\n")
+            except Exception as exc:
+                self._end_step_log(f"기록 종료 통신 실패: {exc}", error=True)
+            return
+        if not self._motor_ready():
+            self._message("장비를 먼저 연결하세요. STEP 로그는 기본 OFF입니다.", "warn")
+            return
+        try:
+            folder = Path(self.save_dir_var.get().strip() or ".")
+            folder.mkdir(parents=True, exist_ok=True)
+            self.step_log_path = folder / f"STEP_4F_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
+            self._step_log = StepLog(self.step_log_path, demo=self.demo)
+            self._step_log_phase = "starting"
+            self._step_log_phase_at = time.monotonic()
+            self.step_log_button.configure(state=tk.DISABLED, text="확인 중…")
+            self._write_motor(b"DIAG,ON\n")
+            self._message("STEP 로그 지원 펌웨어를 확인하는 중…")
+        except Exception as exc:
+            self._end_step_log(f"STEP 로그 시작 실패: {exc}", error=True, send_off=True)
+
+    def _end_step_log(self, reason, *, error=False, send_off=False):
+        log = self._step_log
+        self._step_log = None
+        self._step_log_phase = None
+        self.step_log_button.configure(state=tk.NORMAL, text="STEP 로그")
+        if send_off and self._motor_ready():
+            try:
+                self.arduino.write(b"DIAG,OFF\n")
+            except Exception:
+                pass
+        if log:
+            try:
+                log.close(reason)
+            except OSError as exc:
+                reason = f"STEP 로그 저장 실패: {exc}"
+                error = True
+        self._message(reason, "error" if error else "ok")
+
+    def _check_step_log(self):
+        if not self._step_log:
+            return
+        now = time.monotonic()
+        if self._step_log_phase == "starting" and now - self._step_log_phase_at > 3:
+            self._end_step_log("STEP 로그 응답 없음. 새 진단 펌웨어를 Arduino에 업로드하세요.", error=True, send_off=True)
+        elif self._step_log_phase == "stopping" and now - self._step_log_phase_at > 3:
+            self._end_step_log("STEP 로그 종료 응답 없음. 파일을 닫았습니다(기록 누락 가능).", error=True, send_off=True)
+        elif self._step_log_phase == "active" and now - self._step_log.last_rx > 3:
+            self._end_step_log("STEP 로그 수신이 끊겼습니다. 파일을 닫았습니다.", error=True, send_off=True)
+
     def connect_devices(self):
         try:
             if self.demo:
@@ -739,10 +815,12 @@ class HydrogelStudio:
             self.stop_test()
         if self._motor_ready():
             try:
-                self.arduino.write(stop_command())
+                self._write_motor(stop_command())
                 time.sleep(0.05)
             except Exception:
                 pass
+        if self._step_log:
+            self._end_step_log("연결 해제로 STEP 로그를 저장했습니다(종료 응답 미확인).", send_off=True)
         if self.demo_rig:
             self.demo_rig.close()
             self.demo_rig = None
@@ -783,17 +861,35 @@ class HydrogelStudio:
             if tag == "loadcell":
                 self._on_loadcell_line(line, received_at)
             elif tag == "serial_error":
+                if self._step_log:
+                    self._end_step_log(f"통신 오류로 STEP 로그 종료: {line}", error=True, send_off=True)
                 if self._starting_point:
                     self._stop_start_point(f"탐색 중 통신 오류: {line}", "error")
             else:
                 self._on_motor_line(line, received_at)
         self._check_start_point()
+        self._check_step_log()
         self._check_move_timeout()
         self._schedule(30, self._pump_queue)
 
     # ------------------------------------------------------------------ 수신 처리
     def _on_motor_line(self, line, received_at=None):
         received_at = time.monotonic() if received_at is None else received_at
+        if self._step_log:
+            try:
+                kind = self._step_log.receive(line, received_at)
+                if kind == "ON":
+                    self._step_log_phase = "active"
+                    self.step_log_button.configure(state=tk.NORMAL, text="로그 중지")
+                    self._message(f"STEP 로그 기록 중: {self.step_log_path.name}", "ok")
+                elif kind == "OFF":
+                    self._end_step_log(f"STEP 로그 저장 완료: {self.step_log_path.name}")
+                elif line in ("READY", "ARDUINO_READY") and self._step_log.active:
+                    self._end_step_log("Arduino 재시작으로 STEP 로그를 종료했습니다.", error=True, send_off=True)
+            except (OSError, ValueError) as exc:
+                self._end_step_log(f"STEP 로그 오류: {exc}", error=True, send_off=True)
+        if line.startswith("DBG,"):
+            return
         if line == "STOPPED" and self._starting_point == "stopping" and received_at >= self._start_phase_at:
             self._set_start_point_phase("zeroing")
             self._set_state("ZEROING")
@@ -824,6 +920,7 @@ class HydrogelStudio:
         # 인디케이터의 입력 부호를 유지해 N으로 환산한다.
         self.current_grams = grams
         force = grams_to_newton(grams) - self.force_offset_N
+        self._step_log_record("LOAD", received_at, grams=grams, force_N=force, detail=line)
         self.force_label.configure(text=f"{force:.4f} N")
         self.grams_label.configure(text=f"{grams:.1f} g (raw)")
         if abs(grams) > self.profile.max_load_g * 0.9:
@@ -1131,7 +1228,7 @@ class HydrogelStudio:
             self._request_start_point_stop()
             return
         try:
-            self.arduino.write(jog_command(self.profile.press_cmd, START_POINT_SPEED))
+            self._write_motor(jog_command(self.profile.press_cmd, START_POINT_SPEED))
         except Exception as exc:
             self._stop_start_point(f"탐색 시작 실패: {exc}", "error")
             return
@@ -1143,7 +1240,7 @@ class HydrogelStudio:
     def _request_start_point_stop(self):
         self._set_start_point_phase("stopping")
         try:
-            self.arduino.write(stop_command())
+            self._write_motor(stop_command())
         except Exception as exc:
             self._stop_start_point(f"정지 명령 전송 실패: {exc}", "error")
             return
@@ -1154,7 +1251,7 @@ class HydrogelStudio:
         self._set_start_point_phase(None)
         try:
             if self._motor_ready():
-                self.arduino.write(stop_command())
+                self._write_motor(stop_command())
         except Exception as exc:
             message += f" 정지 명령 전송 실패: {exc}"
             level = "error"
@@ -1207,7 +1304,7 @@ class HydrogelStudio:
         try:
             if float(self.jog_speed_var.get()) > self.profile.max_speed_mm_s:
                 raise ValueError(f"이동 속도는 최대 {self.profile.max_speed_mm_s:g} mm/s 입니다 (펌웨어 상한).")
-            self.arduino.write(jog_command(cmd, self.jog_speed_var.get()))
+            self._write_motor(jog_command(cmd, self.jog_speed_var.get()))
         except ValueError as exc:
             self._message(str(exc), "error")
             return
@@ -1221,7 +1318,7 @@ class HydrogelStudio:
             return
         self.jogging = False
         if self._motor_ready():
-            self.arduino.write(stop_command())
+            self._write_motor(stop_command())
         self._set_state("READY" if not self.is_running else self._state)
 
     def zero_force(self):
@@ -1286,7 +1383,7 @@ class HydrogelStudio:
         self._running_mode = self.mode_var.get()
         self.motor_enabled = True
         self._refresh_motor_status()
-        self.arduino.write(command)
+        self._write_motor(command)
         self._set_state("RUNNING")
         self._message(f"시험 시작: {self.target_dist:g} mm @ {self.test_speed:g} mm/s, 시편 D{diameter:g} x H{self.height0_mm:g} mm (A={self.area_mm2:.2f} mm2, 최대 변형률 {self.target_dist / self.height0_mm * 100:.0f} %)", "ok")
         self._save_settings(quiet=True)
@@ -1331,7 +1428,7 @@ class HydrogelStudio:
         # 키 뗌을 놓쳐도 플래그가 남지 않게 한다. jog_key_active는 두어야 아직 누른 키의 자동 반복이 조그를 다시 시작하지 않는다
         self.jogging = False
         if self._motor_ready():
-            self.arduino.write(stop_command())
+            self._write_motor(stop_command())
         if self.is_running:
             self._finish_test("STOPPED")
             self._message(f"기록 종료. {len(self.time_data)} 샘플 저장.", "ok")
@@ -1343,7 +1440,7 @@ class HydrogelStudio:
         self.jogging = False
         self.jog_key_active = None
         if self._motor_ready():
-            self.arduino.write(stop_command())
+            self._write_motor(stop_command())
         self._finish_test("E-STOP")
         self._message("비상 정지: 모터 이동을 멈췄습니다. 드라이버는 현재 위치를 유지합니다.", "warn")
 
@@ -1353,7 +1450,7 @@ class HydrogelStudio:
             self._message("장비가 연결되어 있지 않습니다.", "warn")
             return
         self.jogging = False
-        self.arduino.write(motor_off_command())
+        self._write_motor(motor_off_command())
         self.motor_enabled = False
         self._refresh_motor_status()
         self._finish_test("MOTOR OFF")
@@ -1365,7 +1462,7 @@ class HydrogelStudio:
         if not self._motor_ready():
             self._message("장비가 연결되어 있지 않습니다.", "warn")
             return
-        self.arduino.write(motor_on_command())
+        self._write_motor(motor_on_command())
         self.motor_enabled = True
         self._refresh_motor_status()
         self._set_state("READY")

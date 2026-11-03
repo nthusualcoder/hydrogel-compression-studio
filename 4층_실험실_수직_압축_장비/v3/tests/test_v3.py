@@ -143,6 +143,85 @@ class AppTests(unittest.TestCase):
         self.assertEqual(str(self.app.update_button.cget("state")), tk.NORMAL)
         self.assertIn("offline", self.app.sb_message.cget("text"))
 
+    def test_step_log_default_off_and_button_handshake_saves_only_when_requested(self):
+        from hydrogel_app.step_log import summarize
+        a = self.app
+        a._on_loadcell_line("0")
+        self.assertIsNone(a._step_log)
+        self.assertEqual(list(Path(self.tmp.name).glob("STEP_*.csv")), [])
+        a.step_log_button.invoke()
+        self.assertEqual(self.motor.writes[-1], b"DIAG,ON\n")
+        self.motor.queue_line("DBG,ON,100,0,0,1\n"); self.pump()
+        self.assertEqual(a.step_log_button.cget("text"), "로그 중지")
+        self.motor.queue_line("DBG,C,200,0,0,start,0.01,0.0025\n")
+        self.motor.queue_line("DBG,S,500200,1,1,500000\n")
+        self.motor.queue_line("DBG,S,1000200,2,2,500000\n")
+        self.loadcell.queue_line("1.1\n"); self.pump()
+        a.step_log_button.invoke()
+        self.assertEqual(self.motor.writes[-1], b"DIAG,OFF\n")
+        self.motor.queue_line("DBG,OFF,1000300,2,2,0:0\n"); self.pump()
+        self.assertIsNone(a._step_log)
+        result = summarize(a.step_log_path)
+        self.assertEqual(result["steps"], 2)
+        self.assertEqual(result["mean_interval_us"], 500000)
+        self.assertTrue(result["complete"])
+        before = a.step_log_path.stat().st_size
+        a._on_loadcell_line("2")
+        self.assertEqual(a.step_log_path.stat().st_size, before)
+
+    def test_step_log_old_firmware_timeout_does_not_start_motion(self):
+        a = self.app
+        a.toggle_step_log()
+        a._step_log_phase_at -= 4
+        a._check_step_log()
+        self.assertIsNone(a._step_log)
+        self.assertIn("펌웨어", a.sb_message.cget("text"))
+        self.assertEqual(self.motor.writes, [b"DIAG,ON\n", b"DIAG,OFF\n"])
+
+    def test_step_log_toggle_does_not_stop_or_change_running_test(self):
+        a = self.app
+        a.start_test()
+        a.toggle_step_log()
+        a._on_motor_line("DBG,ON,1,0,0,1")
+        a.toggle_step_log()
+        a._on_motor_line("DBG,OFF,2,0,0,0:0")
+        self.assertTrue(a.is_running)
+        self.assertEqual(self.motor.writes, [b"start,2,0.5\n", b"DIAG,ON\n", b"DIAG,OFF\n"])
+
+    def test_step_log_disk_error_and_disconnect_close_file(self):
+        a = self.app
+        a.toggle_step_log()
+        a._on_motor_line("DBG,ON,1,0,0,1")
+        log = a._step_log
+        with mock.patch.object(log.writer, "writerow", side_effect=OSError("disk full")):
+            a._on_loadcell_line("1")
+        self.assertIsNone(a._step_log)
+        self.assertTrue(log.file.closed)
+        self.assertIn("저장 실패", a.sb_message.cget("text"))
+        a.toggle_step_log()
+        a._on_motor_line("DBG,ON,1,0,0,1")
+        log = a._step_log
+        a.disconnect_devices()
+        self.assertIsNone(a._step_log)
+        self.assertTrue(log.file.closed)
+
+    def test_step_log_demo_produces_explicitly_simulated_trace(self):
+        from hydrogel_app.step_log import summarize
+        a = self.app
+        a.disconnect_devices()
+        a.demo = True
+        a.connect_devices()
+        a.toggle_step_log(); self.pump(0.2)
+        self.assertEqual(a._step_log_phase, "active")
+        a.jog_speed_var.set("0.005")
+        a.start_jog("JU"); self.pump(0.9)
+        a.stop_jog(); self.pump(0.1)
+        a.toggle_step_log(); self.pump(0.2)
+        result = summarize(a.step_log_path)
+        self.assertTrue(result["demo"])
+        self.assertTrue(result["complete"])
+        self.assertGreaterEqual(result["steps"], 2)
+
     def test_start_point_fixed_speed_threshold_stop_then_zero(self):
         a = self.app
         self.assertEqual(a.start_force_var.get(), "0.01")
@@ -817,7 +896,7 @@ class SmallScreenTests(unittest.TestCase):
         """고정 영역으로 옮긴 버튼도 기존처럼 스크롤 영역 다음 순서여야 한다."""
         a = self.app
         e = a._entries
-        expected = [e[0], e[1], a.disconnect_button, a.save_defaults_button, e[2], a.press_button, a.release_button,
+        expected = [e[0], e[1], a.disconnect_button, a.save_defaults_button, a.step_log_button, e[2], a.press_button, a.release_button,
                     a.zero_button, e[3], a.start_point_button, a._radios[0], a._radios[1], e[4], e[5], e[6], e[7], a._radios[2], a._radios[3],
                     a.sample_rate_box, e[8], a.dir_button, a.start_button, a.stop_button, a.estop_button,
                     a.motor_off_button, a.motor_on_button]

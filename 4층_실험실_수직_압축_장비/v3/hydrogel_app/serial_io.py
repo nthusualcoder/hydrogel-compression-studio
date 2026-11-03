@@ -64,6 +64,11 @@ class DemoRig:
         self.remaining = None        # 자동 이동 잔여 거리
         self.enabled = True
         self._stop = False
+        self._diag = False
+        self._diag_boot = time.monotonic()
+        self._diag_last_status = self._diag_boot
+        self._diag_seq = self._diag_skipped = 0
+        self._diag_position = 0
         self._orig_write = self.motor.write
         self.motor.write = self._on_write
         threading.Thread(target=self._run, daemon=True).start()
@@ -71,6 +76,19 @@ class DemoRig:
     def _on_write(self, data):
         self._orig_write(data)
         cmd = data.decode("ascii", errors="ignore").strip()
+        if cmd == "DIAG,ON":
+            self._diag = True
+            self._diag_seq = self._diag_skipped = 0
+            self._diag_position = round(self.position_mm * 800)
+            self._diag_send("ON", "1")
+            return len(data)
+        elif cmd == "DIAG,OFF":
+            if self._diag:
+                self._diag_send("OFF", f"0:{self._diag_skipped}")
+            self._diag = False
+            return len(data)
+        if self._diag:
+            self._diag_send("C", cmd)
         if cmd.startswith("start,"):
             _, dist, speed = cmd.split(",")
             self.remaining = float(dist)
@@ -101,6 +119,7 @@ class DemoRig:
     def _run(self):
         dt = 0.1
         while not self._stop and self.motor.is_open:
+            step_velocity = self.velocity
             if self.velocity and self.enabled:
                 step = self.velocity * dt
                 if self.remaining is not None:
@@ -111,11 +130,33 @@ class DemoRig:
                     self.remaining = None
                     self.velocity = 0.0
                     self.motor.queue_line("DONE\n")
+            if self._diag:
+                position = round(self.position_mm * 800)
+                delta = position - self._diag_position
+                if delta:
+                    direction = 1 if delta > 0 else -1
+                    if abs(step_velocity) <= 0.010001 and step_velocity:
+                        for _ in range(abs(delta)):
+                            self._diag_seq += 1
+                            self._diag_position += direction
+                            self._diag_send("S", str(round(1_000_000 / abs(step_velocity * 800))))
+                    else:
+                        self._diag_seq += abs(delta)
+                        self._diag_skipped += abs(delta)
+                        self._diag_position = position
+                if time.monotonic() - self._diag_last_status >= 1:
+                    self._diag_last_status = time.monotonic()
+                    self._diag_send("H", f"0:{self._diag_skipped}")
             # 가상 하이드로젤(D10 H5, E≈20 kPa 가정): 0.2 mm 이후 접촉, 이후 거리에 따라 양수 하중 증가
             contact = max(0.0, self.position_mm - 0.2)
             grams = (contact * 32.0 + contact ** 3 * 4.0) + math.sin(time.time() * 7) * 0.05
             self.indicator.queue_line(f"{grams:8.1f}\r\n")
             time.sleep(dt)
+
+    def _diag_send(self, kind, detail):
+        # 데모 시각은 0.1초 가상 갱신 주기에 기반한다. 실물 타이밍 분석에 쓰지 않는다.
+        tick = int((time.monotonic() - self._diag_boot) * 1_000_000) & 0xFFFFFFFF
+        self.motor.queue_line(f"DBG,{kind},{tick},{self._diag_seq},{self._diag_position},{detail}\n")
 
     def close(self):
         self._stop = True

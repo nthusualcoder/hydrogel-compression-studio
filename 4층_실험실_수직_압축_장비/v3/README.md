@@ -52,6 +52,8 @@ pyinstaller --noconfirm --clean build.spec   # dist\HydrogelStudio_4F.exe → v3
 
 ## 시험 흐름
 
+선택형 STEP 진단 기록은 [STEP 로그 사용 안내](STEP_LOG_GUIDE.md)를 참고한다. 연결 영역의 작은 **STEP 로그** 버튼으로 켜고 끈다. 기본 OFF이며, 새 진단 펌웨어 업로드가 별도로 필요하다.
+
 1. 포트를 입력하고 **장비 연결**.
 2. 조그 버튼(또는 ↓ ↑ 키)으로 압축판을 시편 접촉 직전까지 이동.
 3. **Starting point 하중 (N)**을 설정하고 **Starting point 찾기 · 0.01 mm/s**를 누른다. 기준 하중에 도달하면 정지 후 하중을 자동으로 0점 설정한다. 수동으로 위치를 잡았다면 **현재 하중을 0점으로**를 누른다.
