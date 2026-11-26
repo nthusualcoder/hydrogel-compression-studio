@@ -1,6 +1,7 @@
 """Hydrogel Compression Studio v3 - Tkinter GUI (VS Code 스타일)."""
 import argparse
 import csv
+import ctypes
 import math
 import queue
 import threading
@@ -1536,8 +1537,25 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+ES_KEEP_AWAKE = 0x80000003   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+
+
+def keep_awake():
+    """프로그램이 켜져 있는 동안 Windows 자동 절전과 화면 꺼짐을 막는다.
+
+    화면 유지까지 요청하는 것은, 최신 대기(S0) 노트북이 화면이 꺼지면 프로그램을 멈추기 때문이다.
+    요청은 이 스레드에 묶여 있어 프로그램이 끝나면(비정상 종료 포함) Windows가 스스로 해제한다.
+    덮개 닫기, 전원 단추, 시작 메뉴의 절전, 배터리 방전은 막지 못한다.
+    """
+    try:
+        return ctypes.windll.kernel32.SetThreadExecutionState(ES_KEEP_AWAKE) != 0
+    except (AttributeError, OSError):
+        return False
+
+
 def main(argv=None):
     args = parse_args(argv)
+    keep_awake()      # mainloop가 도는 메인 스레드에서 호출해야 종료할 때까지 유지된다
     root = tk.Tk()
     HydrogelStudio(root, PROFILE, demo=args.demo, initial_theme=args.theme)
     root.mainloop()

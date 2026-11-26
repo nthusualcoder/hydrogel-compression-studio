@@ -1271,5 +1271,19 @@ class SmallScreenTests(unittest.TestCase):
         self.assertEqual(self.font_size(a.force_label), 34)
 
 
+class KeepAwakeTests(unittest.TestCase):
+    def test_main_asks_windows_to_stay_awake_with_display_on(self):
+        from hydrogel_app import app as app_module
+        windll = mock.MagicMock()
+        windll.kernel32.SetThreadExecutionState.return_value = 0x80000000
+        with mock.patch("hydrogel_app.app.ctypes.windll", windll, create=True), \
+                mock.patch("hydrogel_app.app.tk.Tk") as tk_cls, \
+                mock.patch("hydrogel_app.app.HydrogelStudio"):
+            app_module.main([])
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        windll.kernel32.SetThreadExecutionState.assert_called_once_with(0x80000003)
+        tk_cls.return_value.mainloop.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
